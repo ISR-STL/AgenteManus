@@ -11,7 +11,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -31,8 +30,8 @@ jobs:
             exit 0
           fi
           TEXT="🚀 Push em $REPO ($BRANCH) por $ACTOR
-          $MSG
-          $SHA"
+$MSG
+$SHA"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
             --data-urlencode text="$TEXT" >/dev/null
