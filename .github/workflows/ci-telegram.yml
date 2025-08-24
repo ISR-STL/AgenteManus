@@ -1,4 +1,4 @@
-﻿name: CI — Telegram & README
+﻿name: CI - Telegram & README
 
 on:
   push:
@@ -27,10 +27,10 @@ jobs:
           MSG:    ${{ github.event.head_commit.message }}
         run: |
           if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
-            echo "Sem secrets TELEGRAM_* — pulando notificação."
+            echo "Sem secrets TELEGRAM_* - pulando notificação."
             exit 0
           fi
-          TEXT="✅ Push em $REPO ($BRANCH) por $ACTOR
+          TEXT="🚀 Push em $REPO ($BRANCH) por $ACTOR
           $MSG
           $SHA"
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
