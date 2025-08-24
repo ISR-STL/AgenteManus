@@ -1,0 +1,7 @@
+﻿workspace/auth-config.json
+workspace/*.secret
+*.sqlite*
+*.db
+.env
+__pycache__/
+*.pyc
