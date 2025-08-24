@@ -1,1 +1,1 @@
-Atualizado via REST ✅ 2025-08-24T15:35:09
+Atualizado via cmdlet ✅ 2025-08-24T15:39:36
