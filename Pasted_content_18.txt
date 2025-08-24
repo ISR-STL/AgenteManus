@@ -1,0 +1,199 @@
+	•	instala e configura ADB (Platform-Tools);
+	•	entrega o stack base (agent/core, adapters, policies);
+	•	cria o agent.py orquestrador com policy/telemetria;
+	•	adiciona adapters: powershell.run, web.action (Playwright), llm.openai, adb completo;
+	•	instala dependências (venv, pip, Playwright);
+	•	cria playbooks extras ADB (pair, install, grant, forward/reverse, uninstall) e exemplos OS/Web/LLM;
+	•	(opcional) agenda uma coleta ADB horária com schtasks.
+
+Rode no PowerShell como Administrador:
+
+# ===============================
+# AgentOS - Power Stack + ADB (setup único)
+# ===============================
+param(
+  [switch]$CreateScheduledADBJob = $false,   # cria tarefa horária de screenshot via ADB
+  [string]$Root = "C:\AgentOS"
+)
+
+$ErrorActionPreference = "Stop"
+
+# --- Pastas
+$AgentDir = Join-Path $Root "agent"
+$CoreDir  = Join-Path $AgentDir "core"
+$AdpDir   = Join-Path $AgentDir "adapters"
+$PolDir   = Join-Path $AgentDir "policies"
+$PbDir    = Join-Path $AgentDir "playbooks"
+$OutDir   = Join-Path $AgentDir "output\android"
+$LogsDir  = Join-Path $AgentDir "logs"
+$Scripts  = Join-Path $Root  "scripts"
+New-Item -ItemType Directory -Force -Path $AgentDir,$CoreDir,$AdpDir,$PolDir,$PbDir,$OutDir,$LogsDir,$Scripts | Out-Null
+
+# --- requirements.txt (pinos seguros e estáveis)
+$req = @'
+openai==1.43.0
+playwright==1.46.0
+psutil==5.9.8
+PyYAML==6.0.2
+structlog==24.1.0
+httpx==0.27.0
+requests==2.32.3
+beautifulsoup4==4.12.3
+selectolax==0.3.23
+lxml==5.2.2
+'@
+Set-Content -Path (Join-Path $AgentDir "requirements.txt") -Value $req -Encoding UTF8
+
+# --- venv + deps
+if(!(Test-Path (Join-Path $Root ".venv"))){
+  py -3 -m venv (Join-Path $Root ".venv")
+}
+$Py = Join-Path $Root ".venv\Scripts\python.exe"
+$Pip = Join-Path $Root ".venv\Scripts\pip.exe"
+& $Pip install --upgrade pip
+& $Pip install -r (Join-Path $AgentDir "requirements.txt")
+& $Py -m playwright install chromium
+
+# --- Core: registry/auth/scheduler/memory (stubs)
+$registry_py = @'
+# agent/core/registry.py
+from typing import Any, Dict, Callable
+
+REGISTRY: Dict[str, Any] = {}
+
+def register(name: str, obj: Any):
+    REGISTRY[name] = obj
+
+def get(name: str) -> Any:
+    return REGISTRY[name]
+'@
+Set-Content "$CoreDir\registry.py" $registry_py -Encoding UTF8
+
+$auth_py = @'
+# agent/core/auth.py
+import re, yaml
+from typing import Dict, Any
+
+class Policy:
+    def __init__(self, path: str):
+        with open(path, "r", encoding="utf-8") as f:
+            self.spec = yaml.safe_load(f) or {}
+    def allowed(self, tool: str, action: str, args: Dict[str,Any]) -> (bool,str):
+        tools = (self.spec.get("tools") or {}).get(tool) or {}
+        default = tools.get("default","deny").lower()
+        allow = tools.get("allow") or []
+        reqconf = tools.get("require_confirm") or []
+        # match allow
+        ok = (default == "allow")
+        for rule in allow:
+            if rule.get("action")==action:
+                pat = ((rule.get("args") or {}).get("cmd"))  # ex.: regex p/ shell cmd
+                if not pat: ok = True
+                else:
+                    val = (args or {}).get("cmd","")
+                    ok = re.search(pat, val) is not None
+                if ok: break
+        if not ok: return False, "blocked_by_policy"
+        # require confirm?
+        for rule in reqconf:
+            if rule.get("action")==action:
+                return False, "require_confirm"
+        return True, ""
+'@
+Set-Content "$CoreDir\auth.py" $auth_py -Encoding UTF8
+
+$scheduler_py = @'
+# agent/core/scheduler.py  (stub; agendamento via schtasks feito no PowerShell)
+def info():
+    return {"scheduler":"windows_schtasks_external"}
+'@
+Set-Content "$CoreDir\scheduler.py" $scheduler_py -Encoding UTF8
+
+$memory_py = @'
+# agent/core/memory.py  (stub para futura FAISS/Chroma)
+class Memory:
+    def search(self, q:str): return []
+    def add(self, text:str, meta=None): return True
+'@
+Set-Content "$CoreDir\memory.py" $memory_py -Encoding UTF8
+
+# --- Adapters: PowerShell, Web (Playwright), LLM (OpenAI), ADB
+$powershell_py = @'
+# agent/adapters/powershell.py
+import subprocess, datetime
+
+class PowerShell:
+    name = "powershell.run"
+    def describe(self): return {"args":{"script":"str"}, "risk":"MEDIUM"}
+    def run(self, script:str):
+        started = datetime.datetime.utcnow().isoformat()
+        p = subprocess.run(["powershell","-NoProfile","-Command",script], capture_output=True, text=True)
+        return {"started":started,"returncode":p.returncode,"stdout":p.stdout,"stderr":p.stderr}
+'@
+Set-Content "$AdpDir\powershell.py" $powershell_py -Encoding UTF8
+
+$web_py = @'
+# agent/adapters/web_playwright.py
+from playwright.sync_api import sync_playwright
+
+class WebAction:
+    name = "web.action"
+    def describe(self): return {"args":{"url":"str","steps":"list"}}
+    def run(self, url:str, steps:list):
+        with sync_playwright() as p:
+            b = p.chromium.launch(headless=True)
+            page = b.new_page()
+            page.goto(url, wait_until="networkidle")
+            for s in steps:
+                op = s.get("op")
+                if op=="fill": page.fill(s["sel"], s["value"])
+                elif op=="click": page.click(s["sel"])
+                elif op=="wait": page.wait_for_timeout(int(s["ms"]))
+                elif op=="type": page.type(s["sel"], s["text"])
+            html = page.content()
+            b.close()
+        return {"ok":True,"snapshot_len":len(html)}
+'@
+Set-Content "$AdpDir\web_playwright.py" $web_py -Encoding UTF8
+
+$llm_py = @'
+# agent/adapters/llm_openai.py
+import os
+from openai import OpenAI
+
+class LLMInvoke:
+    name = "llm.openai"
+    def describe(self): return {"args":{"prompt":"str","model":"str"}}
+    def run(self, prompt:str, model:str="gpt-4o-mini"):
+        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        if not client.api_key:
+            raise RuntimeError("OPENAI_API_KEY não configurada no ambiente.")
+        out = client.chat.completions.create(
+            model=model,
+            messages=[{"role":"user","content":prompt}],
+            temperature=0.2
+        )
+        return {"text": out.choices[0].message.content}
+'@
+Set-Content "$AdpDir\llm_openai.py" $llm_py -Encoding UTF8
+
+$adb_py = @'
+# agent/adapters/adb_tool.py
+import os, subprocess, pathlib
+
+class ADB:
+    def __init__(self, auditor):
+        self.audit = auditor
+        self.adb = os.getenv("ADB_EXE","adb")
+    def _cmd(self, base, device=None):
+        cmd=[self.adb]; 
+        if device: cmd+=["-s", device]
+        return cmd+base
+    def _run(self, args, device=None, timeout=180, binary=False):
+        cp = subprocess.run(self._cmd(args, device), capture_output=True, timeout=timeout)
+        out = cp.stdout if binary else cp.stdout.decode("utf-8","ignore")
+        err = cp.stderr.decode("utf-8","ignore")
+        if cp.returncode!=0: raise RuntimeError(err.strip() or "adb error")
+        return out
+    # operações
+    def devices(self): 

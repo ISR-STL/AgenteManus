@@ -1,0 +1,199 @@
+
+Abaixo te entrego um add-on Web3 em uma única execução PowerShell que:
+	•	cria um token ERC-20,
+	•	sobe um contrato de pré-venda com whitelist, hardcap, mínima/máxima por carteira e vesting,
+	•	prepara Hardhat (deploy/verify),
+	•	entrega um frontend Next.js + wagmi/RainbowKit para o painel do investidor,
+	•	inclui um monitor de eventos on-chain que envia logs ao Loki,
+	•	adiciona playbook e tarefa agendada para acompanhar a venda.
+
+Rode como Administrador no PowerShell (Windows). Ele reaproveita o Node, Loki e a estrutura do C:\AgentOS que já criamos.
+
+⸻
+
+1) Script único: Web3 Presale Add-on
+
+Copie/cole tudo no PowerShell:
+
+# ===============================
+# AgentOS - Web3 Presale Add-on
+# Requisitos prévios: Node LTS, Git, .venv do AgentOS, Loki/Grafana
+# ===============================
+param(
+  [string]$Root = "C:\AgentOS",
+  [switch]$ScheduleMonitor = $true
+)
+
+$ErrorActionPreference = "Stop"
+$Base = Join-Path $Root "web3\presale"
+$Api  = Join-Path $Base "api"
+$Dapp = Join-Path $Base "frontend"
+$Logs = Join-Path $Root "agent\logs"
+New-Item -ItemType Directory -Force -Path $Base,$Api,$Dapp,$Logs | Out-Null
+
+# --- .env (placeholders)
+$envPath = Join-Path $Root ".env"
+if(!(Test-Path $envPath)){ New-Item -ItemType File -Force -Path $envPath | Out-Null }
+$add = @(
+"RPC_URL_SEPOLIA=",
+"PRIVATE_KEY=",             # chave da carteira de deploy (use uma conta de teste!)
+"ETHERSCAN_API_KEY=",
+"USDC_SEPOLIA=0x...        # opcional, ERC20 estável de teste; se vazio, venda em ETH",
+"OPENAI_API_KEY=",          # já existia; mantém
+"LOKI_URL=http://localhost:3100"
+)
+foreach($l in $add){
+  if(-not (Select-String -Path $envPath -Pattern ('^'+[regex]::Escape(($l -split '=')[0])+'=') -Quiet)){
+    Add-Content $envPath $l
+  }
+}
+
+# --- Backend Web3 (Hardhat)
+Set-Content (Join-Path $Api "package.json") (@'
+{
+  "name": "agentos-presale",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "build": "echo ok",
+    "hh": "hardhat",
+    "deploy:sepolia": "hardhat run scripts/deploy.js --network sepolia",
+    "verify:sepolia": "hardhat verify --network sepolia"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "dotenv": "^16.4.5",
+    "hardhat": "^2.22.5"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^4.9.6",
+    "ethers": "^6.13.2"
+  }
+}
+'@) -Encoding UTF8
+
+Push-Location $Api
+npm i > $null
+# contracts
+New-Item -ItemType Directory -Force -Path "contracts","scripts" | Out-Null
+
+# Token ERC20 simples (mint controlado pelo owner = contrato de venda)
+Set-Content ".\contracts\Token.sol" (@'
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract SaleToken is ERC20, Ownable {
+    constructor(string memory n, string memory s) ERC20(n, s) Ownable(msg.sender) {}
+    function mint(address to, uint256 amount) external onlyOwner { _mint(to, amount); }
+}
+'@) -Encoding UTF8
+
+# Contrato de Pré-venda (ETH OU USDC), whitelist, min/max, hardcap e vesting linear
+Set-Content ".\contracts\PreSale.sol" (@'
+/**
+ * SPDX-License-Identifier: MIT
+ * ATENÇÃO: template educacional. Faça auditoria antes de usar em produção.
+ */
+pragma solidity ^0.8.20;
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+interface ISaleToken {
+    function mint(address to, uint256 amount) external;
+    function decimals() external view returns (uint8);
+}
+
+contract PreSale is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    ISaleToken public immutable token;
+    address public immutable treasury;      // recebe ETH/USDC
+    IERC20 public immutable usdc;           // opcional (0 = sem USDC)
+
+    uint256 public priceUsd6;               // preço por token em "USD 6 decimais" (ex.: 5 cents = 0.05 * 1e6 = 50000)
+    uint256 public minUsd6;                 // mínimo por carteira em USD6
+    uint256 public maxUsd6;                 // máximo por carteira em USD6
+    uint256 public hardcapUsd6;             // hardcap total em USD6
+
+    uint64  public startTs;
+    uint64  public endTs;
+    bool    public paused;
+
+    mapping(address => bool) public whitelist;
+    mapping(address => uint256) public contributedUsd6;
+    uint256 public raisedUsd6;
+
+    // Vesting linear
+    struct Vesting { uint64 start; uint64 duration; uint256 total; uint256 claimed; }
+    mapping(address => Vesting) public vest;
+
+    event Purchased(address indexed buyer, uint256 usd6, uint256 tokens);
+    event Claimed(address indexed user, uint256 amount);
+
+    constructor(
+        address _token, address _treasury, address _usdc,
+        uint256 _priceUsd6, uint256 _minUsd6, uint256 _maxUsd6, uint256 _hardcapUsd6,
+        uint64 _startTs, uint64 _endTs
+    ) {
+        require(_token!=address(0) && _treasury!=address(0), "bad addr");
+        require(_priceUsd6>0 && _startTs<_endTs, "bad params");
+        token = ISaleToken(_token);
+        treasury = _treasury;
+        usdc = IERC20(_usdc);
+        priceUsd6 = _priceUsd6;
+        minUsd6 = _minUsd6;
+        maxUsd6 = _maxUsd6;
+        hardcapUsd6 = _hardcapUsd6;
+        startTs = _startTs;
+        endTs = _endTs;
+    }
+
+    modifier isLive() {
+        require(!paused && block.timestamp>=startTs && block.timestamp<=endTs, "not live");
+        _;
+    }
+
+    function setWhitelist(address[] calldata users, bool allowed) external onlyOwner {
+        for(uint i=0;i<users.length;i++){ whitelist[users[i]] = allowed; }
+    }
+    function pause(bool p) external onlyOwner { paused=p; }
+
+    // Compra com USDC (6 decimais)
+    function buyUSDC(uint256 amountUsd6, uint64 vestDuration) external nonReentrant isLive {
+        require(address(usdc)!=address(0), "USDC disabled");
+        _process(msg.sender, amountUsd6, vestDuration, true);
+        usdc.safeTransferFrom(msg.sender, treasury, amountUsd6);
+    }
+
+    // Compra com ETH: converte ETH em "USD6" usando um preço fixo passado pelo front (com tolerância) => simplificado.
+    // Em produção, use oráculo (Chainlink) e/ou venda apenas em stable.
+    function buyETH(uint256 quotedUsd6, uint64 vestDuration) external payable nonReentrant isLive {
+        // checagem mínima: msg.value > 0 e quoted enviado pelo front (slippage controlada fora)
+        require(msg.value > 0 && quotedUsd6>0, "bad eth");
+        _process(msg.sender, quotedUsd6, vestDuration, false);
+        (bool ok,)=treasury.call{value: msg.value}(""); require(ok,"treasury");
+    }
+
+    function _process(address buyer, uint256 usd6, uint64 vestDuration, bool isUsdc) internal {
+        require(whitelist[buyer], "not whitelisted");
+        require(raisedUsd6 + usd6 <= hardcapUsd6, "hardcap");
+        uint256 newC = contributedUsd6[buyer] + usd6;
+        require(newC >= minUsd6 && newC <= maxUsd6, "limits");
+        contributedUsd6[buyer] = newC;
+        raisedUsd6 += usd6;
+
+        uint256 dec = token.decimals();
+        uint256 tokens = (usd6 * (10 ** dec)) / priceUsd6; // tokens = USD6 / price * 10^dec
+        // inicia/atualiza vesting linear desde agora
+        Vesting storage v = vest[buyer];
+        if(v.total==0){ v.start = uint64(block.timestamp); v.duration = vestDuration; }
+        else { require(v.start>0 && v.duration==vestDuration, "vesting mismatch"); }
+        v.total += tokens;
+
+        token.mint(address(this), tokens);  // mint para o contrato -> usuário faz claim conforme libera
+        emit Purchased(buyer, usd6, tokens);
+    }

@@ -1,0 +1,396 @@
+Bora deixar isso 100% autônomo. Abaixo te entrego um “modo daemon” para o Agente — ele roda como tarefa agendada/serviço, entende seus comandos em linguagem natural (PowerShell, Telegram e “inbox” de arquivos), planeja → executa as capabilities (deploy/verify/admin/monitor/web/OS) e manda telemetria pro Loki/Grafana. Tudo em uma única execução PowerShell.
+
+⸻
+
+🚀 Instalação “one-shot” (cole no PowerShell como Admin)
+
+Pré-requisitos já ok no seu ambiente: Docker/Loki/Grafana prontos, Node+Hardhat criados no pacote anterior em C:\AgentOS\web3\presale_pro.
+Você só precisa completar o .env com chaves (veja “Próximos passos” no final).
+
+# =====================================================================
+# AgentOS Daemon – Automação total (NL → Ação) + Web3 + OS + Monitor
+# =====================================================================
+param(
+  [string]$Root="C:\AgentOS",
+  [string]$Py="C:\AgentOS\.venv\Scripts\python.exe"
+)
+$ErrorActionPreference="Stop"
+function _ok($m){Write-Host "[OK] $m" -Fore Green}
+function _inf($m){Write-Host "[..] $m" -Fore Yellow}
+function _die($m){Write-Error $m; exit 1}
+
+# Pastas
+$Agent = Join-Path $Root "agent"
+$Core  = Join-Path $Agent "core"
+$Adap  = Join-Path $Agent "adapters"
+$Inbox = Join-Path $Root "inbox"
+$Logs  = Join-Path $Root "logs"
+$scripts = Join-Path $Root "scripts"
+$Api   = Join-Path $Root "web3\presale_pro\api"
+$Dapp  = Join-Path $Root "web3\presale_pro\frontend"
+
+$null = New-Item -ItemType Directory -Force -Path $Agent,$Core,$Adap,$Inbox,$Logs,$scripts
+
+# .env (com chaves que o daemon usa)
+$envPath = Join-Path $Root ".env"
+if(!(Test-Path $envPath)){ New-Item -ItemType File -Force -Path $envPath | Out-Null }
+$envAdd = @(
+"OPENAI_API_KEY=",
+"OLLAMA_HOST=http://localhost:11434",
+"TELEGRAM_BOT_TOKEN=",
+"TELEGRAM_ALLOWED_IDS=",
+"LOKI_URL=http://localhost:3100/loki/api/v1/push",
+"RPC_URL_BSCTEST=",
+"RPC_URL_BSC=",
+"PRIVATE_KEY=",
+"BSCSCAN_API_KEY=",
+"NEXT_PUBLIC_CHAIN=bscTestnet"
+)
+foreach($l in $envAdd){
+  if(-not (Select-String -Path $envPath -Pattern ('^'+[regex]::Escape(($l -split '=')[0])+'=') -Quiet)){
+    Add-Content $envPath $l
+  }
+}
+_ok ".env base garantido em $envPath"
+
+# requirements do daemon
+$req = @'
+python-dotenv==1.0.*
+pyyaml==6.*
+watchdog==4.*
+requests==2.*
+httpx==0.27.*
+apscheduler==3.10.*
+psutil==5.*
+rich==13.*
+python-telegram-bot==21.*
+'@
+Set-Content (Join-Path $Agent "requirements-agent.txt") $req -Encoding UTF8
+_ok "requirements-agent.txt"
+
+# ---------------- core ----------------
+$registry = @'
+from typing import Protocol, Any, Dict
+REGISTRY: dict[str, "Capability"] = {}
+class Capability(Protocol):
+    name: str
+    def describe(self) -> Dict[str, Any]: ...
+    def run(self, **kwargs) -> Dict[str, Any]: ...
+def register(cap: "Capability"):
+    REGISTRY[cap.name] = cap
+def execute(name: str, **kwargs):
+    cap = REGISTRY[name]
+    return cap.run(**kwargs)
+'@
+Set-Content (Join-Path $Core "registry.py") $registry -Encoding UTF8
+
+$auth = @'
+import os, json
+ALLOWED = {
+  "danger": False,  # mude p/ True se quiser permitir operações perigosas sem confirmação
+  "owners": [
+    "0xAAA12D72B8C40e78a47f99492d12E13b8e6559b9",
+    "0x72a23589f70D30A60c70FfF8c195EB4EE8F556f6"
+  ]
+}
+def can(action: str) -> bool:
+  # regra simples: tudo permitido exceto "danger.*" quando danger=False
+  if action.startswith("danger.") and not ALLOWED["danger"]:
+    return False
+  return True
+'@
+Set-Content (Join-Path $Core "auth.py") $auth -Encoding UTF8
+
+$telemetry = @'
+import os, time, json, requests
+LOKI_URL = os.getenv("LOKI_URL","")
+LABELS = {"app":"AgentOS","host":"windows"}
+def push_loki(msg: dict):
+  if not LOKI_URL: return
+  try:
+    streams = [{
+      "stream": LABELS,
+      "values": [[str(int(time.time()*1e9)), json.dumps(msg, ensure_ascii=False)]]
+    }]
+    requests.post(LOKI_URL, json={"streams":streams}, timeout=3)
+  except Exception: pass
+'@
+Set-Content (Join-Path $Core "telemetry.py") $telemetry -Encoding UTF8
+
+# ---------------- adapters ----------------
+$ps_adapter = @'
+import subprocess, datetime
+from core.registry import register, Capability
+class PowerShell(Capability):
+    name = "os.powershell"
+    def describe(self): return {"args":{"script":"str"}}
+    def run(self, script: str):
+        started = datetime.datetime.utcnow().isoformat()
+        p = subprocess.run(["powershell","-NoProfile","-Command",script], capture_output=True, text=True)
+        return {"started": started, "returncode": p.returncode, "stdout": p.stdout, "stderr": p.stderr}
+register(PowerShell())
+'@
+Set-Content (Join-Path $Adap "windows_os.py") $ps_adapter -Encoding UTF8
+
+$web3_adapter = @"
+import os, subprocess, json, pathlib
+from core.registry import register, Capability
+API = pathlib.Path(r'$Api')
+class Web3Deploy(Capability):
+    name='web3.deploy_all'
+    def describe(self): return {'args':{'chain':'str','verify':'bool'}}
+    def run(self, chain:str='bscTestnet', verify:bool=True):
+        env = os.environ.copy()
+        cwd = str(API)
+        out1 = subprocess.run(['npx','hardhat','run','scripts/deploy_all.js','--network',chain], cwd=cwd, capture_output=True, text=True)
+        res = {'deploy_rc': out1.returncode, 'deploy_out': out1.stdout, 'deploy_err': out1.stderr}
+        if verify and out1.returncode==0:
+            out2 = subprocess.run(['npx','hardhat','run','scripts/verify_all.js','--network',chain], cwd=cwd, capture_output=True, text=True)
+            res.update({'verify_rc': out2.returncode, 'verify_out': out2.stdout, 'verify_err': out2.stderr})
+        return res
+class Web3Verify(Capability):
+    name='web3.verify_all'
+    def describe(self): return {'args':{'chain':'str'}}
+    def run(self, chain:str='bscTestnet'):
+        out = subprocess.run(['npx','hardhat','run','scripts/verify_all.js','--network',chain], cwd=str(API), capture_output=True, text=True)
+        return {'rc': out.returncode, 'out': out.stdout, 'err': out.stderr}
+class Web3Admin(Capability):
+    name='web3.admin'
+    def describe(self): return {'args':{'chain':'str','presale':'str','action':'str','value':'str','addresses':'list[str]'}}
+    def run(self, chain='bscTestnet', presale='', action='pause', value='true', addresses=None):
+        args = ['node','scripts/admin.js', f'--chain={chain}', f'--presale={presale}', f'--action={action}']
+        if action=='pause': args.append(f'--value={value}')
+        if action=='whitelist': args.append(f'--addresses={",".join(addresses or [])}')
+        out = subprocess.run(args, cwd=str(API), capture_output=True, text=True)
+        return {'rc': out.returncode, 'out': out.stdout, 'err': out.stderr}
+register(Web3Deploy()); register(Web3Verify()); register(Web3Admin())
+"@
+Set-Content (Join-Path $Adap "web3.py") $web3_adapter -Encoding UTF8
+
+$lp_adapter = @'
+import pathlib, datetime
+from core.registry import register, Capability
+TEMPLATE = """<!doctype html><html><head><meta charset="utf-8">
+<title>{title}</title><meta name="viewport" content="width=device-width, initial-scale=1">
+<style>body{font-family:sans-serif;max-width:860px;margin:40px auto;padding:0 20px}
+.btn{padding:12px 18px;border:1px solid #333;display:inline-block;text-decoration:none}</style></head>
+<body><h1>{title}</h1><p>{subtitle}</p>
+<p><b>Token:</b> {token}<br><b>Network:</b> {chain}</p>
+<a class="btn" href="{dapp}">Abrir DApp</a>
+<hr><small>Gerado por AgentOS em {ts}</small></body></html>"""
+class LandGen(Capability):
+    name="web.landing.generate"
+    def describe(self): return {"args":{"title":"str","subtitle":"str","token":"str","chain":"str","outdir":"str","dapp":"str"}}
+    def run(self, title="Pré-venda", subtitle="Participe agora", token="", chain="bscTestnet", outdir=r"C:\AgentOS\www", dapp="http://localhost:5173"):
+        p = pathlib.Path(outdir); p.mkdir(parents=True, exist_ok=True)
+        html = TEMPLATE.format(title=title, subtitle=subtitle, token=token, chain=chain, dapp=dapp, ts=datetime.datetime.utcnow().isoformat())
+        f = p/"index.html"; f.write_text(html, encoding="utf-8")
+        return {"ok": True, "file": str(f)}
+register(LandGen())
+'@
+Set-Content (Join-Path $Adap "landing.py") $lp_adapter -Encoding UTF8
+
+# ---------------- agent.py (daemon) ----------------
+$agent = @"
+import os, time, json, queue, threading, pathlib, re
+from dotenv import load_dotenv
+from rich import print
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from apscheduler.schedulers.background import BackgroundScheduler
+
+from core.registry import REGISTRY, register, execute
+from core import auth
+from core.telemetry import push_loki
+
+# carregar adapters
+import adapters.windows_os  # os.powershell
+import adapters.web3        # web3.deploy_all / verify_all / admin
+import adapters.landing     # web.landing.generate
+
+load_dotenv(os.path.join(r'$Root', '.env'))
+
+ROOT = pathlib.Path(r'$Root')
+INBOX = ROOT/'inbox'
+LOGS  = ROOT/'logs'
+LOGS.mkdir(exist_ok=True)
+
+JOBS = queue.Queue()
+STOP = threading.Event()
+
+def plan_simple(text: str):
+    """
+    Plano por regex (fallback offline). 
+    Se OPENAI_API_KEY estiver setado, você pode trocar por um parser com LLM.
+    """
+    t = text.lower().strip()
+    # web3 deploy
+    m = re.search(r'\bdeploy\b.*\b(bsc|bsctestnet|sepolia|mainnet)\b', t)
+    if m: 
+        chain = 'bsc' if 'bsc ' in t else ('bscTestnet' if 'bsctestnet' in t else ('sepolia' if 'sepolia' in t else 'mainnet'))
+        verify = 'noverify' not in t
+        return {"action":"web3.deploy_all", "params":{"chain": chain, "verify": verify}}
+    # verify
+    m = re.search(r'\bverify\b.*\b(bsc|bsctestnet|sepolia|mainnet)\b', t)
+    if m:
+        chain = 'bsc' if 'bsc ' in t else ('bscTestnet' if 'bsctestnet' in t else ('sepolia' if 'sepolia' in t else 'mainnet'))
+        return {"action":"web3.verify_all", "params":{"chain": chain}}
+    # pause/unpause
+    m = re.search(r'\b(pause|unpause)\b.*(0x[a-f0-9]{40})', t)
+    if m:
+        val = 'true' if 'pause' in t and 'un' not in t else 'false'
+        presale = m.group(2)
+        chain = 'bscTestnet' if 'bsctestnet' in t else ('bsc' if ' bsc' in t else 'sepolia')
+        return {"action":"web3.admin", "params":{"chain": chain, "presale": presale, "action":"pause", "value": val}}
+    # whitelist
+    m = re.search(r'\bwhitelist\b.*(0x[a-f0-9]{40}).*?(0x[a-f0-9]{40}(?:,0x[a-f0-9]{40})*)', t)
+    if m:
+        presale = m.group(1); adds = m.group(2).split(',')
+        chain = 'bscTestnet' if 'bsctestnet' in t else ('bsc' if ' bsc' in t else 'sepolia')
+        return {"action":"web3.admin", "params":{"chain": chain, "presale": presale, "action":"whitelist", "addresses": adds}}
+    # landing
+    if 'landing' in t or 'landpage' in t or 'página' in t:
+        return {"action":"web.landing.generate", "params":{"title":"Pré-venda", "subtitle":"Aproveite oportunidade", "token":"","chain":"bscTestnet"}}
+    # powershell (explícito)
+    m = re.search(r'ps:(.+)$', text, re.I|re.S)
+    if m:
+        return {"action":"os.powershell", "params":{"script": m.group(1).strip()}}
+    return None
+
+class InboxHandler(FileSystemEventHandler):
+    def on_created(self, event):
+        if event.is_directory or not event.src_path.lower().endswith(('.yml','.yaml','.txt','.md','.json')): return
+        time.sleep(0.2)
+        p = pathlib.Path(event.src_path)
+        try:
+            if p.suffix in ('.yml','.yaml'):
+                import yaml; data = yaml.safe_load(p.read_text(encoding='utf-8'))
+            elif p.suffix=='.json':
+                data = json.loads(p.read_text(encoding='utf-8'))
+            else:
+                data = {"ask": p.read_text(encoding='utf-8')}
+        except Exception as e:
+            data = {"ask": f"erro ao ler {p.name}: {e}"}
+        JOBS.put({"source":"inbox","file":str(p),"task":data})
+
+def worker():
+    while not STOP.is_set():
+        try:
+            job = JOBS.get(timeout=0.5)
+        except queue.Empty:
+            continue
+        out = {"ok":False}
+        try:
+            task = job.get("task",{})
+            desc = task.get("ask")
+            if desc:
+                plan = plan_simple(desc)
+            else:
+                plan = {"action": task.get("action"), "params": task.get("params",{})}
+            if not plan: 
+                out = {"ok":False, "error":"sem plano", "task":task}
+            else:
+                action = plan["action"]; params = plan.get("params",{})
+                if not auth.can(action):
+                    out = {"ok":False, "denied":action}
+                else:
+                    res = execute(action, **params)
+                    out = {"ok":True, "action":action, "params":params, "result":res}
+        except Exception as e:
+            out = {"ok":False, "error":str(e)}
+        finally:
+            try: push_loki({"event":"job", **out})
+            except: pass
+            with open(LOGS/"agent.jsonl","a",encoding="utf-8") as f:
+                f.write(json.dumps(out, ensure_ascii=False)+"\n")
+
+def telegram_loop():
+    tok = os.getenv("TELEGRAM_BOT_TOKEN","")
+    if not tok: return
+    from telegram import Update
+    from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+    allowed = {x.strip() for x in os.getenv("TELEGRAM_ALLOWED_IDS","").split(",") if x.strip()}
+    async def any_msg(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+        uid = str(update.effective_user.id)
+        if allowed and uid not in allowed:
+            await update.message.reply_text("Acesso negado.")
+            return
+        text = update.message.text or ""
+        JOBS.put({"source":"telegram","task":{"ask":text}})
+        await update.message.reply_text("OK, executando: "+text[:120])
+    app = ApplicationBuilder().token(tok).build()
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), any_msg))
+    app.run_polling()
+
+def main():
+    # watcher de inbox
+    INBOX.mkdir(exist_ok=True)
+    handler = InboxHandler()
+    obs = Observer(); obs.schedule(handler, str(INBOX), recursive=False); obs.start()
+
+    # worker
+    t = threading.Thread(target=worker, daemon=True); t.start()
+
+    # telegram (opcional)
+    threading.Thread(target=telegram_loop, daemon=True).start()
+
+    print("[AgentOS] Daemon iniciado. Inbox:", INBOX)
+    try:
+        while True: time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        STOP.set(); obs.stop(); obs.join()
+
+if __name__ == "__main__":
+    main()
+"@
+Set-Content (Join-Path $Agent "agent.py") $agent -Encoding UTF8
+
+# ---------------- scripts PowerShell de controle ----------------
+$cli = @"
+param([ValidateSet('start','stop','status','submit','tail')]`$Cmd, [string]`$Text)
+`$py = '$Py'
+`$agent = 'C:\AgentOS\agent\agent.py'
+`$inbox = 'C:\AgentOS\inbox'
+if(`$Cmd -eq 'start'){
+  schtasks /Create /TN AgentOS_Daemon /SC ONLOGON /RL LIMITED /TR ""`"$py`" `"$agent`"" /F | Out-Null
+  Write-Host 'Daemon agendado (ONLOGON).'
+} elseif(`$Cmd -eq 'stop'){
+  schtasks /Delete /TN AgentOS_Daemon /F | Out-Null
+  Write-Host 'Daemon removido.'
+} elseif(`$Cmd -eq 'status'){
+  schtasks /Query /TN AgentOS_Daemon 2>`$null
+} elseif(`$Cmd -eq 'submit'){
+  if(-not `$Text){ throw 'Use: -Text ""seu pedido em NL ou action JSON""' }
+  if(`$Text.Trim().StartsWith('{')){
+    `$name = (Get-Date -Format "yyyyMMdd-HHmmss") + '-task.json'
+    `$content = `$Text
+  } else {
+    `$name = (Get-Date -Format "yyyyMMdd-HHmmss") + '-ask.txt'
+    `$content = `$Text
+  }
+  `$path = Join-Path `$inbox `$name
+  `$content | Out-File -Encoding utf8 `$path
+  Write-Host "Task criada: `$path"
+} elseif(`$Cmd -eq 'tail'){
+  Get-Content C:\AgentOS\logs\agent.jsonl -Wait -Encoding UTF8
+}
+"@
+Set-Content (Join-Path $scripts "Agent.ps1") $cli -Encoding UTF8
+_ok "CLI do Agente: $scripts\Agent.ps1"
+
+# venv: instala pacotes do daemon
+if(!(Test-Path $Py)){ _die "Python do venv não encontrado em $Py (use o venv padrão que criamos antes)." }
+& $Py -m pip install -r (Join-Path $Agent "requirements-agent.txt") | Out-Null
+_ok "Dependências Python do daemon instaladas"
+
+# Tarefa ONLOGON para manter agente vivo
+schtasks /Create /TN AgentOS_Daemon /SC ONLOGON /RL LIMITED /TR "`"$Py`" `"$Agent\agent.py`"" /F | Out-Null
+_ok "Tarefa agendada: AgentOS_Daemon (inicia no logon)"
+
+Write-Host "`n=== Próximos passos ==="
+Write-Host "1) Edite $envPath e preencha: PRIVATE_KEY, RPC_URL_BSCTEST/BSC, BSCSCAN_API_KEY, TELEGRAM_* (se quiser), LOKI_URL."
+Write-Host "2) Inicie/forçe agora:  . $scripts\Agent.ps1 start"
+Write-Host "3
+(Content truncated due to size limit. Use page ranges or line ranges to read remaining content)

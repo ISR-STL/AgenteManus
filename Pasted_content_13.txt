@@ -1,0 +1,398 @@
+Perfeito. Abaixo vai um PATCH único (PowerShell) que aplica todas as melhorias no agente:
+	•	Planner com Ollama (interpreta seus pedidos em linguagem natural e transforma em ações JSON).
+	•	Bot Telegram com comando /status.
+	•	Novas capabilities para melhorar páginas por arquivo, gerar cópias de marketing, e criar apps Next.js/Streamlit.
+	•	Atualiza dependências e reinicia o daemon.
+
+Cole tudo este script no PowerShell (como Admin). Ele só sobrescreve/ cria arquivos dentro de C:\AgentOS.
+
+⸻
+
+PATCH-02 – Ollama Planner + /status + Pages & Apps
+
+# =====================================================================
+# PATCH-02-AgentOS.ps1  (rode como Admin)
+# =====================================================================
+param(
+  [string]$Root="C:\AgentOS",
+  [string]$Py="C:\AgentOS\.venv\Scripts\python.exe"
+)
+$ErrorActionPreference="Stop"
+function OK($m){Write-Host "[OK] $m" -Fore Green}
+function INF($m){Write-Host "[..] $m" -Fore Yellow}
+function DIE($m){Write-Error $m; exit 1}
+
+$Agent = Join-Path $Root "agent"
+$Core  = Join-Path $Agent "core"
+$Adap  = Join-Path $Agent "adapters"
+$Inbox = Join-Path $Root "inbox"
+$Logs  = Join-Path $Root "logs"
+$scripts = Join-Path $Root "scripts"
+$null = New-Item -ItemType Directory -Force -Path $Agent,$Core,$Adap,$Inbox,$Logs,$scripts
+
+# --- garantir .env com OLLAMA ---
+$envPath = Join-Path $Root ".env"
+if(!(Test-Path $envPath)){ New-Item -ItemType File -Force -Path $envPath | Out-Null }
+$ensure=@(
+"OLLAMA_HOST=http://localhost:11434",
+"OLLAMA_MODEL=llama3",
+"TELEGRAM_BOT_TOKEN=",
+"TELEGRAM_ALLOWED_IDS="
+)
+foreach($l in $ensure){
+  if(-not (Select-String -Path $envPath -Pattern ('^'+[regex]::Escape(($l -split '=')[0])+'=') -Quiet)){
+    Add-Content $envPath $l
+  }
+}
+OK ".env atualizado para Ollama/Telegram"
+
+# --- requirements (inclui bs4/lxml) ---
+$req = @'
+python-dotenv==1.0.*
+pyyaml==6.*
+watchdog==4.*
+requests==2.*
+httpx==0.27.*
+apscheduler==3.10.*
+psutil==5.*
+rich==13.*
+python-telegram-bot==21.*
+beautifulsoup4==4.*
+lxml==4.*
+'@
+Set-Content (Join-Path $Agent "requirements-agent.txt") $req -Encoding UTF8
+OK "requirements atualizados"
+
+# ---------------- core/registry.py (se ainda não existir)
+if(!(Test-Path (Join-Path $Core "registry.py"))){
+$registry = @'
+from typing import Protocol, Any, Dict
+REGISTRY: dict[str, "Capability"] = {}
+class Capability(Protocol):
+    name: str
+    def describe(self) -> Dict[str, Any]: ...
+    def run(self, **kwargs) -> Dict[str, Any]: ...
+def register(cap: "Capability"):
+    REGISTRY[cap.name] = cap
+def execute(name: str, **kwargs):
+    cap = REGISTRY[name]
+    return cap.run(**kwargs)
+'@
+Set-Content (Join-Path $Core "registry.py") $registry -Encoding UTF8
+OK "core/registry.py criado"
+}
+
+# ---------------- core/auth.py (regra simples)
+$auth = @'
+ALLOWED = {"danger": False}
+def can(action: str) -> bool:
+  if action.startswith("danger.") and not ALLOWED["danger"]:
+    return False
+  return True
+'@
+Set-Content (Join-Path $Core "auth.py") $auth -Encoding UTF8
+OK "core/auth.py atualizado"
+
+# ---------------- core/telemetry.py (Loki push)
+$telemetry = @'
+import os, time, json, requests
+LOKI_URL = os.getenv("LOKI_URL","")
+LABELS = {"app":"AgentOS","host":"windows"}
+def push_loki(msg: dict):
+  if not LOKI_URL: return
+  try:
+    streams = [{"stream": LABELS,"values": [[str(int(time.time()*1e9)), json.dumps(msg, ensure_ascii=False)]]}]
+    requests.post(LOKI_URL, json={"streams":streams}, timeout=3)
+  except Exception: pass
+'@
+Set-Content (Join-Path $Core "telemetry.py") $telemetry -Encoding UTF8
+
+# ---------------- adapters/windows_os.py (PowerShell runner)
+$ps_adapter = @'
+import subprocess, datetime
+from core.registry import register, Capability
+class PowerShell(Capability):
+    name = "os.powershell"
+    def describe(self): return {"args":{"script":"str"}}
+    def run(self, script: str):
+        started = datetime.datetime.utcnow().isoformat()
+        p = subprocess.run(["powershell","-NoProfile","-Command",script], capture_output=True, text=True)
+        return {"started": started, "returncode": p.returncode, "stdout": p.stdout, "stderr": p.stderr}
+register(PowerShell())
+'@
+Set-Content (Join-Path $Adap "windows_os.py") $ps_adapter -Encoding UTF8
+
+# ---------------- adapters/ollama_llm.py (planner via Ollama)
+$ollama = @'
+import os, json, httpx
+HOST = os.getenv("OLLAMA_HOST","http://localhost:11434")
+MODEL = os.getenv("OLLAMA_MODEL","llama3")
+def chat(system: str, user: str) -> str:
+    url = HOST.rstrip("/") + "/api/chat"
+    payload = {"model": MODEL, "stream": False, "messages":[{"role":"system","content":system},{"role":"user","content":user}]}
+    r = httpx.post(url, json=payload, timeout=120)
+    r.raise_for_status()
+    return r.json()["message"]["content"]
+
+SCHEMA = """Responda **apenas** com JSON válido:
+{
+  "action": "nome_da_capability",
+  "params": { "k":"v" }
+}
+Ações suportadas:
+- web3.deploy_all {chain: bsc|bscTestnet|sepolia|mainnet, verify: bool}
+- web3.verify_all {chain: ...}
+- web3.admin {chain:..., presale: "0x...", action: pause|whitelist, value: "true|false", addresses: ["0x..."]}
+- web.landing.generate {title, subtitle, token, chain, outdir, dapp}
+- web.page.rewrite {path, tone, goals, cta}
+- mk.copy {vertical, goal, audience, style}
+- app.scaffold.next {name, dir, withTailwind}
+- app.scaffold.streamlit {name, dir}
+- os.powershell {script}
+"""
+
+def plan_with_llm(text: str):
+    try:
+        sys = "Você é um planejador que converte pedidos em ações atômicas."
+        prompt = f"{SCHEMA}\n\nPedido:\n{text}"
+        out = chat(sys, prompt).strip()
+        return json.loads(out)
+    except Exception:
+        return None
+'@
+Set-Content (Join-Path $Adap "ollama_llm.py") $ollama -Encoding UTF8
+
+# ---------------- adapters/page_tools.py (melhorar página por arquivo)
+$page = @'
+import os, json
+from bs4 import BeautifulSoup
+from core.registry import register, Capability
+from adapters.ollama_llm import chat
+
+PROMPT = """Você é um copywriter técnico. Melhore TÍTULO, META DESCRIPTION e a seção HERO desta página para {goals}.
+Mantenha a estrutura HTML. Devolva **apenas** um JSON:
+{"title":"...","description":"...","h1":"...","h2":"...","p":"...","cta":"..."}
+
+TOM desejado: {tone}
+CTA principal: {cta}
+Público: decisores com pouco tempo."""
+
+class PageRewrite(Capability):
+    name="web.page.rewrite"
+    def describe(self): return {"args":{"path":"str","tone":"str","goals":"str","cta":"str"}}
+    def run(self, path:str, tone:str="autoridade", goals:str="aumentar conversões", cta:str="Fale com especialista"):
+        html = open(path, "r", encoding="utf-8", errors="ignore").read()
+        soup = BeautifulSoup(html, "lxml")
+        user = PROMPT.format(tone=tone, goals=goals, cta=cta)
+        resp = chat("Otimize conteúdo mantendo semântica HTML.", user)
+        data = json.loads(resp)
+        # aplica no DOM com segurança
+        if soup.title and data.get("title"): soup.title.string = data["title"]
+        if data.get("description"):
+            meta = soup.find("meta", attrs={"name":"description"})
+            if not meta:
+                meta = soup.new_tag("meta"); meta["name"]="description"; soup.head.append(meta)
+            meta["content"]=data["description"]
+        if data.get("h1"):
+            h1 = soup.find("h1") or soup.new_tag("h1")
+            h1.string = data["h1"]
+            if not h1.parent: soup.body.insert(0,h1)
+        if data.get("h2"):
+            h2 = soup.find("h2") or soup.new_tag("h2")
+            h2.string = data["h2"]
+            if not h2.parent: soup.body.insert(1,h2)
+        if data.get("p"):
+            ptag = soup.find("p") or soup.new_tag("p")
+            ptag.string = data["p"]
+            if not ptag.parent: soup.body.insert(2,ptag)
+        if data.get("cta"):
+            from bs4 import NavigableString
+            a = soup.find("a", attrs={"class":"btn"}) or soup.new_tag("a"); a["class"]="btn"; a["href"]="#lead"
+            a.string = data["cta"]
+            if not a.parent: soup.body.insert(3,a)
+        out = path
+        open(out, "w", encoding="utf-8").write(str(soup))
+        return {"ok": True, "file": out, "applied": data}
+
+# gerar cópias de marketing
+class MkCopy(Capability):
+    name="mk.copy"
+    def describe(self): return {"args":{"vertical":"str","goal":"str","audience":"str","style":"str"}}
+    def run(self, vertical:str, goal:str="gerar leads", audience:str="PMEs", style:str="direto"):
+        prompt = f"Crie blocos de copy (headline, sub, bullets, CTA) para {vertical}. Objetivo: {goal}. Público: {audience}. Estilo: {style}. Devolva JSON."
+        out = chat("Copywriter especialista em funis e LPs.", prompt)
+        return {"copy": json.loads(out)}
+register(PageRewrite()); register(MkCopy())
+'@
+Set-Content (Join-Path $Adap "page_tools.py") $page -Encoding UTF8
+
+# ---------------- adapters/site_scaffold.py (criar apps)
+$scaf = @'
+import os, subprocess, pathlib
+from core.registry import register, Capability
+
+class NextApp(Capability):
+    name="app.scaffold.next"
+    def describe(self): return {"args":{"name":"str","dir":"str","withTailwind":"bool"}}
+    def run(self, name:str, dir:str, withTailwind:bool=True):
+        p = pathlib.Path(dir); p.mkdir(parents=True, exist_ok=True)
+        args = ["npx","create-next-app@latest",name,"--typescript","--eslint","--no-src-dir","--app","--skip-install"]
+        if withTailwind: args += ["--tailwind"]
+        out = subprocess.run(args, cwd=dir, capture_output=True, text=True)
+        return {"rc": out.returncode, "out": out.stdout, "err": out.stderr, "path": str(p/name)}
+
+class StreamlitApp(Capability):
+    name="app.scaffold.streamlit"
+    def describe(self): return {"args":{"name":"str","dir":"str"}}
+    def run(self, name:str, dir:str):
+        p = pathlib.Path(dir); p.mkdir(parents=True, exist_ok=True)
+        app = p/name; app.mkdir(parents=True, exist_ok=True)
+        (app/"app.py").write_text('import streamlit as st\nst.title("Nova App - "+__file__)\n', encoding="utf-8")
+        return {"ok": True, "path": str(app)}
+register(NextApp()); register(StreamlitApp())
+'@
+Set-Content (Join-Path $Adap "site_scaffold.py") $scaf -Encoding UTF8
+
+# ---------------- agent.py (daemon com planner LLM + /status)
+$agent = @"
+import os, time, json, queue, threading, pathlib, re, datetime
+from dotenv import load_dotenv
+from rich import print
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from core.registry import REGISTRY, execute
+from core import auth
+from core.telemetry import push_loki
+
+# adapters carregados
+import adapters.windows_os        # os.powershell
+import adapters.ollama_llm        # plan_with_llm
+import adapters.page_tools        # web.page.rewrite, mk.copy
+try:
+    import adapters.web3          # se você já tem o pacote web3 do passo anterior
+    HAVE_WEB3=True
+except Exception:
+    HAVE_WEB3=False
+try:
+    import adapters.site_scaffold # app.scaffold.*
+except Exception:
+    pass
+
+ROOT = pathlib.Path(r'$Root'); load_dotenv(ROOT/'.env')
+INBOX = ROOT/'inbox'; LOGS = ROOT/'logs'; LOGS.mkdir(exist_ok=True)
+STOP = threading.Event(); JOBS = queue.Queue()
+
+def plan_simple(text: str):
+    t = text.lower().strip()
+    # deploy/verify/admin (regex fallback)
+    m = re.search(r'\bdeploy\b.*\b(bsc|bsctestnet|sepolia|mainnet)\b', t)
+    if m and HAVE_WEB3: 
+        chain = {'bsc':'bsc','bsctestnet':'bscTestnet','sepolia':'sepolia','mainnet':'mainnet'}[m.group(1)]
+        verify = 'noverify' not in t
+        return {"action":"web3.deploy_all","params":{"chain":chain,"verify":verify}}
+    m = re.search(r'\bverify\b.*\b(bsc|bsctestnet|sepolia|mainnet)\b', t)
+    if m and HAVE_WEB3:
+        chain = {'bsc':'bsc','bsctestnet':'bscTestnet','sepolia':'sepolia','mainnet':'mainnet'}[m.group(1)]
+        return {"action":"web3.verify_all","params":{"chain":chain}}
+    m = re.search(r'\b(pause|unpause)\b.*(0x[a-f0-9]{40})', t)
+    if m and HAVE_WEB3:
+        val = 'false' if 'unpause' in t else 'true'
+        presale = m.group(2)
+        chain = 'bscTestnet' if 'bsctestnet' in t else ('bsc' if ' bsc' in t else 'sepolia')
+        return {"action":"web3.admin","params":{"chain":chain,"presale":presale,"action":"pause","value":val}}
+    # páginas
+    m = re.search(r'(melhor|otimiz|reescreva).*?(c:\\\\[^\\n]+?\\.html)', t, re.I)
+    if m:
+        return {"action":"web.page.rewrite","params":{"path":m.group(2),"tone":"autoridade","goals":"converter","cta":"Fale conosco"}}
+    # powershell direto: ps:<script>
+    m = re.search(r'ps:(.+)$', text, re.I|re.S)
+    if m: return {"action":"os.powershell","params":{"script":m.group(1).strip()}}
+    return None
+
+def plan(text: str):
+    try:
+        from adapters.ollama_llm import plan_with_llm
+        j = plan_with_llm(text)
+        if j and isinstance(j, dict) and "action" in j: return j
+    except Exception: pass
+    return plan_simple(text)
+
+class InboxHandler(FileSystemEventHandler):
+    def on_created(self, event):
+        if event.is_directory or not event.src_path.lower().endswith(('.yml','.yaml','.txt','.md','.json')): return
+        time.sleep(0.2)
+        p = pathlib.Path(event.src_path)
+        try:
+            if p.suffix in ('.yml','.yaml'):
+                import yaml; data = yaml.safe_load(p.read_text(encoding='utf-8'))
+            elif p.suffix=='.json':
+                data = json.loads(p.read_text(encoding='utf-8'))
+            else:
+                data = {"ask": p.read_text(encoding='utf-8')}
+        except Exception as e:
+            data = {"ask": f"erro ao ler {p.name}: {e}"}
+        JOBS.put({"source":"inbox","file":str(p),"task":data})
+
+def run_job(task:dict):
+    desc = task.get("ask")
+    plan_obj = plan(desc) if desc else {"action":task.get("action"),"params":task.get("params",{})}
+    if not plan_obj: return {"ok":False,"error":"sem plano", "task":task}
+    action = plan_obj["action"]; params = plan_obj.get("params",{})
+    if not auth.can(action): return {"ok":False,"denied":action}
+    res = execute(action, **params)
+    return {"ok":True,"action":action,"params":params,"result":res}
+
+def worker():
+    while not STOP.is_set():
+        try: job = JOBS.get(timeout=0.5)
+        except queue.Empty: continue
+        out = {"ok":False}
+        try: out = run_job(job.get("task",{}))
+        except Exception as e: out={"ok":False,"error":str(e)}
+        finally:
+            try: push_loki({"event":"job", **out})
+            except: pass
+            with open(LOGS/"agent.jsonl","a",encoding="utf-8") as f: f.write(json.dumps(out, ensure_ascii=False)+"\n")
+
+# Telegram opcional, com /status
+def telegram_loop():
+    tok = os.getenv("TELEGRAM_BOT_TOKEN","")
+    if not tok: return
+    from telegram import Update
+    from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+    allowed = {x.strip() for x in os.getenv("TELEGRAM_ALLOWED_IDS","").split(",") if x.strip()}
+    async def any_msg(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+        uid = str(update.effective_user.id)
+        if allowed and uid not in allowed:
+            await update.message.reply_text("Acesso negado."); return
+        text = update.message.text or ""
+        JOBS.put({"source":"telegram","task":{"ask":text}})
+        await update.message.reply_text("OK, executando: "+text[:120])
+    async def status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+        p = LOGS/'agent.jsonl'
+        last=[]; 
+        if p.exists():
+            try:
+                with open(p,'r',encoding='utf-8') as f:
+                    lines = f.readlines()[-60:]
+                for ln in lines:
+                    try: last.append(json.loads(ln))
+                    except: pass
+            except: pass
+        oks = sum(1 for x in last if x.get("ok"))
+        errs = [x for x in last if not x.get("ok")]
+        recent = "\n".join([f"- {x.get('action')} → {'OK' if x.get('ok') else 'ERRO'}" for x in last[-8:]])
+        msg = f"AgentOS /status\nJobs OK: {oks}/{len(last)}\nErros recentes: {len(errs)}\n{recent}"
+        await update.message.reply_text(msg or "Sem dados.")
+    app = ApplicationBuilder().token(tok).build()
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), any_msg))
+    app.run_polling()
+
+def main():
+    INBOX.mkdir(exist_ok=True)
+    import threading
+    from watchdog.observers import Observer
+    handler = InboxHandler()
+    obs = Observer(); obs.schedule(handle
+(Content truncated due to size limit. Use page ranges or line ranges to read remaining content)

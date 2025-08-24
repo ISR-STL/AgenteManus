@@ -1,0 +1,404 @@
+Perfeito! Abaixo vai o PATCH “Varredura + Lote + Presale” para você colar no PowerShell.
+Ele adiciona ao seu stack:
+	•	Varredura de páginas e código-fonte em múltiplas pastas/drives (inclui rede/NAS).
+	•	Reescrita em lote (jurídico, nutrição, academia, café — ou o que você definir) com metas/tom/CTA por subpasta.
+	•	Template Next.js para painel de pré-vendas cripto (MetaMask + ethers), empacotado em Docker.
+	•	Agendador: varre a cada X horas e, se ativado, reescreve automaticamente.
+	•	APIs já integradas: Ollama (planner), Playwright, WinRM, BscScan, Loki/Grafana.
+	•	Backup/Restore para replicar em vários notebooks.
+
+Rode como Administrador. Se já tem o stack anterior (C:\AgentOS\stack), este patch só acrescenta/atualiza.
+
+⸻
+
+PATCH — Varredura + Lote + Presale (PowerShell)
+
+# =====================================================================
+# STACK-PATCH-ScanBatch-Next.ps1  (execute como Administrador)
+# =====================================================================
+param([string]$ROOT="C:\AgentOS\stack")
+$ErrorActionPreference="Stop"
+function OK($m){Write-Host "[OK] $m" -f Green}
+function INF($m){Write-Host "[-] $m" -f Yellow}
+function WRN($m){Write-Host "[!] $m" -f Magenta}
+function DIE($m){Write-Host "[ERRO] $m" -f Red; exit 1}
+
+# Pastas
+$APP = Join-Path $ROOT "app"
+$PAGES = Join-Path $ROOT "pages"
+$INBOX = Join-Path $ROOT "inbox"
+New-Item -ItemType Directory -Force -Path $ROOT,$APP,$PAGES,$INBOX | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $APP "adapters"), (Join-Path $APP "core") | Out-Null
+
+# 1) Ajustes do .env (acrescenta variáveis de scan/lote/presale se faltarem)
+$envPath = Join-Path $ROOT ".env"
+if(-not (Test-Path $envPath)){ 
+  DIE "Não encontrei $envPath. Rode primeiro o instalador base do stack (STACK-DOCKER-AgentOS.ps1)."
+}
+$envTxt = Get-Content $envPath -Raw
+
+function Add-IfMissing([string]$key,[string]$val){
+  if($envTxt -notmatch ("(?m)^"+[regex]::Escape($key)+"=")){
+    Add-Content -Path $envPath -Value "$key=$val"
+  }
+}
+Add-IfMissing "SCAN_ENABLED" "true"
+Add-IfMissing "SCAN_ROOTS" "C:\AgentOS\stack\pages;C:\Sites;D:\Projetos;\\NAS\Sites"
+Add-IfMissing "SCAN_INTERVAL_HOURS" "12"
+Add-IfMissing "REWRITE_BATCH_ENABLED" "false"
+Add-IfMissing "REWRITE_PLAN_PATH" "/app/pages/rewrite-plan.json"
+Add-IfMissing "REWRITE_BATCH_LIMIT" "100"
+Add-IfMissing "NEXT_PUBLIC_TOKEN_ADDRESS" ""
+Add-IfMissing "NEXT_PUBLIC_CHAIN_RPC" "https://bsc-dataseed1.binance.org"
+Add-IfMissing "NEXT_PUBLIC_SITE_TITLE" "Pré-venda do Token"
+OK ".env atualizado"
+
+# 2) Plano padrão de reescrita em lote
+$planJson = @'
+{
+  "rules": [
+    {"match": "jurid",    "tone": "autoridade e confiança", "goals": "captação de casos",       "cta": "Agendar avaliação"},
+    {"match": "nutri",    "tone": "motivador e empático",    "goals": "consultas e planos",      "cta": "Começar agora"},
+    {"match": "academ",   "tone": "energia e resultado",     "goals": "matrículas",              "cta": "Matricule-se"},
+    {"match": "cafe",     "tone": "premium e sensorial",     "goals": "assinaturas e vendas",    "cta": "Provar agora"}
+  ],
+  "default": {"tone":"profissional","goals":"gerar leads","cta":"Fale conosco"}
+}
+'@
+$planPath = Join-Path $PAGES "rewrite-plan.json"
+$planJson | Set-Content -Path $planPath -Encoding UTF8
+OK "rewrite-plan.json criado em $planPath"
+
+# 3) Adapters: fs.scan e batch_rewrite
+@'
+import os, pathlib, json, time
+from core.registry import register, Capability
+
+DEFAULT_EXTS = {"html","htm","md","css","js","jsx","ts","tsx","py","ipynb","json"}
+DEFAULT_EXC  = {"node_modules",".git","dist","build","out","__pycache__",".next",".venv",".mypy_cache",".pytest_cache"}
+
+class FSScan(Capability):
+    name="fs.scan"
+    def describe(self): 
+        return {"args":{"roots":"list[str]","exts":"list[str]","exclude":"list[str]","max_files":"int"}}
+    def run(self, roots:list[str], exts:list[str]|None=None, exclude:list[str]|None=None, max_files:int=10000):
+        exts=set(exts or DEFAULT_EXTS); exc=set(exclude or DEFAULT_EXC)
+        files=[]
+        for root in roots:
+            p=pathlib.Path(root)
+            if not p.exists(): 
+                continue
+            for f in p.rglob("*"):
+                if any(part in exc for part in f.parts): 
+                    continue
+                if f.is_file() and f.suffix.lower().lstrip(".") in exts:
+                    files.append(str(f))
+                    if len(files)>=max_files: break
+            if len(files)>=max_files: break
+        index_path=pathlib.Path("/app/pages/_scan_index.json")
+        index={"time":int(time.time()),"count":len(files),"files":files}
+        index_path.write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"ok":True,"count":len(files),"index":str(index_path)}
+
+register(FSScan())
+'@ | Set-Content -Path (Join-Path $APP "adapters\fs_scan.py") -Encoding UTF8
+
+@'
+import json, pathlib
+from core.registry import register, Capability, execute
+
+class BatchRewrite(Capability):
+    name="web.page.batch_rewrite"
+    def describe(self): 
+        return {"args":{"roots":"list[str]","plan_path":"str","limit":"int"}}
+    def load_plan(self, plan_path:str):
+        try:
+            return json.loads(pathlib.Path(plan_path).read_text(encoding="utf-8"))
+        except Exception:
+            return {"rules": [], "default":{"tone":"profissional","goals":"gerar leads","cta":"Fale conosco"}}
+    def decide(self, plan:dict, path_str:str):
+        p=path_str.lower()
+        for r in plan.get("rules",[]):
+            if r.get("match","").lower() in p:
+                return r
+        return plan.get("default",{"tone":"profissional","goals":"gerar leads","cta":"Fale conosco"})
+    def run(self, roots:list[str], plan_path:str="/app/pages/rewrite-plan.json", limit:int=200):
+        plan=self.load_plan(plan_path); changed=[]
+        for root in roots:
+            for f in pathlib.Path(root).rglob("*.html"):
+                rule=self.decide(plan, str(f))
+                res=execute("web.page.rewrite", path=str(f), tone=rule.get("tone","profissional"),
+                            goals=rule.get("goals","gerar leads"), cta=rule.get("cta","Fale conosco"))
+                changed.append({"file":str(f),"rule":rule,"ok":res.get("ok",False)})
+                if len(changed)>=limit: break
+            if len(changed)>=limit: break
+        return {"ok":True,"count":len(changed),"changed":changed}
+
+register(BatchRewrite())
+'@ | Set-Content -Path (Join-Path $APP "adapters\batch_rewrite.py") -Encoding UTF8
+
+# 4) Atualiza agent.py para agendar varredura + reescrita em lote
+@'
+import os, json, time, threading, queue, pathlib, datetime
+from dotenv import load_dotenv
+from rich import print
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
+from apscheduler.schedulers.background import BackgroundScheduler
+from flask import Flask, jsonify, request
+from core.registry import REGISTRY, execute
+from core import auth
+from core.telemetry import push
+
+# Adapters base
+import adapters.ollama_llm
+import adapters.page_tools
+import adapters.web_playwright
+import adapters.winrm_ps
+import adapters.web3_bsc
+# Novos
+import adapters.fs_scan
+import adapters.batch_rewrite
+
+ROOT=pathlib.Path("/app")
+INBOX=ROOT/"inbox"
+PAGES=ROOT/"pages"
+load_dotenv(ROOT/".env") if (ROOT/".env").exists() else None
+
+SCAN_ENABLED = os.getenv("SCAN_ENABLED","true").lower()=="true"
+SCAN_ROOTS   = [x.strip() for x in os.getenv("SCAN_ROOTS","/app/pages").split(";") if x.strip()]
+SCAN_INTERVAL_HOURS = int(os.getenv("SCAN_INTERVAL_HOURS","12"))
+REWRITE_BATCH_ENABLED = os.getenv("REWRITE_BATCH_ENABLED","false").lower()=="true"
+REWRITE_PLAN_PATH = os.getenv("REWRITE_PLAN_PATH","/app/pages/rewrite-plan.json")
+REWRITE_BATCH_LIMIT = int(os.getenv("REWRITE_BATCH_LIMIT","100"))
+
+STOP=threading.Event()
+JOBS=queue.Queue()
+SCHED=BackgroundScheduler()
+
+# HTTP
+app=Flask(__name__)
+@app.get("/health")
+def health(): 
+    return jsonify({"ok":True,"caps":list(REGISTRY.keys()),"time":time.time(),
+                    "scan":{"enabled":SCAN_ENABLED,"roots":SCAN_ROOTS,"interval_h":SCAN_INTERVAL_HOURS},
+                    "batch":{"enabled":REWRITE_BATCH_ENABLED,"limit":REWRITE_BATCH_LIMIT}})
+
+@app.post("/scan/run")
+def scan_run():
+    threading.Thread(target=scheduled_scan, daemon=True).start()
+    return jsonify({"ok":True,"triggered":True})
+
+def run_http(): app.run(host="0.0.0.0", port=8088, threaded=True)
+
+# Inbox → fila
+class InboxHandler(FileSystemEventHandler):
+    def on_created(self, e):
+        if e.is_directory: return
+        if not any(e.src_path.lower().endswith(x) for x in (".json",".yml",".yaml",".txt",".md")): return
+        time.sleep(0.2)
+        p=pathlib.Path(e.src_path)
+        try:
+            data=json.loads(p.read_text(encoding="utf-8")) if p.suffix==".json" else {"ask": p.read_text(encoding="utf-8")}
+        except Exception as ex:
+            data={"ask": f"erro ao ler {p.name}: {ex}"}
+        JOBS.put({"source":"inbox","file":str(p),"task":data})
+
+# Planner (Ollama)
+def plan(text:str)->dict|None:
+    from adapters.ollama_llm import ask
+    j=ask(text)
+    if not j: return None
+    return j if isinstance(j,dict) and "action" in j else None
+
+# Execução de job
+def run_job(task:dict):
+    lic=task.get("license_key")
+    if not auth.has_license(lic): return {"ok":False,"error":"license invalid or missing"}
+    action=task.get("action"); params=task.get("params",{})
+    if not action and task.get("ask"): 
+        plan_obj=plan(task["ask"]) or {}
+        action=plan_obj.get("action"); params=plan_obj.get("params",{})
+    if not action: return {"ok":False,"error":"no action"}
+    if not auth.can(action): return {"ok":False,"error":"denied"}
+    res=execute(action, **params)
+    return {"ok":True,"action":action,"params":params,"result":res}
+
+def worker():
+    while not STOP.is_set():
+        try: job=JOBS.get(timeout=0.5)
+        except queue.Empty: continue
+        started=time.time()
+        out={"ok":False}
+        try: out=run_job(job.get("task",{}))
+        except Exception as e: out={"ok":False,"error":str(e)}
+        out["latency_ms"]=int((time.time()-started)*1000)
+        push({"event":"job", **out})
+
+# Auditoria de páginas (log no Loki)
+def audit_pages():
+    pages=list(PAGES.rglob("*.html"))
+    push({"event":"audit.start","count":len(pages)})
+    for p in pages[:200]:
+        push({"event":"audit.page","file":str(p)})
+
+# Varredura + (opcional) reescrita em lote
+def scheduled_scan():
+    if not SCAN_ENABLED: 
+        return
+    try:
+        res=execute("fs.scan", roots=SCAN_ROOTS, exts=None, exclude=None, max_files=10000)
+        push({"event":"scan","ok":True,"count":res.get("count",0)})
+    except Exception as e:
+        push({"event":"scan","ok":False,"error":str(e)})
+    if REWRITE_BATCH_ENABLED:
+        try:
+            rr=execute("web.page.batch_rewrite", roots=SCAN_ROOTS, plan_path=REWRITE_PLAN_PATH, limit=REWRITE_BATCH_LIMIT)
+            push({"event":"batch_rewrite","ok":True,"count":rr.get("count",0)})
+        except Exception as e:
+            push({"event":"batch_rewrite","ok":False,"error":str(e)})
+
+# Telegram opcional (/status) – igual versão anterior
+def telegram_loop():
+    tok=os.getenv("TELEGRAM_BOT_TOKEN","")
+    if not tok: return
+    from telegram import Update
+    from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
+    allowed={x.strip() for x in os.getenv("TELEGRAM_ALLOWED_IDS","").split(",") if x.strip()}
+    async def any_msg(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+        uid=str(update.effective_user.id)
+        if allowed and uid not in allowed:
+            await update.message.reply_text("Acesso negado."); return
+        text=update.message.text or ""
+        JOBS.put({"source":"telegram","task":{"ask":text}})
+        await update.message.reply_text("OK, executando.")
+    async def status(update:Update, ctx:ContextTypes.DEFAULT_TYPE):
+        await update.message.reply_text("AgentOS rodando. Caps: "+", ".join(REGISTRY.keys()))
+    app=ApplicationBuilder().token(tok).build()
+    app.add_handler(CommandHandler("status", status))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), any_msg))
+    app.run_polling()
+
+def main():
+    INBOX.mkdir(exist_ok=True); PAGES.mkdir(exist_ok=True)
+    obs=Observer(); h=InboxHandler(); obs.schedule(h, str(INBOX), recursive=False); obs.start()
+    t=threading.Thread(target=worker, daemon=True); t.start()
+    threading.Thread(target=telegram_loop, daemon=True).start()
+    # Jobs
+    from datetime import datetime
+    SCHED.add_job(audit_pages, "interval", hours=6, next_run_time=datetime.now())
+    if SCAN_ENABLED:
+        SCHED.add_job(scheduled_scan, "interval", hours=SCAN_INTERVAL_HOURS, next_run_time=datetime.now())
+    SCHED.start()
+    run_http()
+
+if __name__=="__main__": main()
+'@ | Set-Content -Path (Join-Path $APP "agent.py") -Encoding UTF8
+OK "agent.py atualizado"
+
+# 5) Presale App (Next.js + ethers)
+$PRES = Join-Path $ROOT "presale-app"
+New-Item -ItemType Directory -Force -Path $PRES, (Join-Path $PRES "pages"), (Join-Path $PRES "components"), (Join-Path $PRES "lib") | Out-Null
+
+@'
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install --omit=dev
+COPY . .
+ENV NEXT_TELEMETRY_DISABLED=1
+RUN npm run build
+EXPOSE 3000
+CMD ["npm","start","-p","3000"]
+'@ | Set-Content -Path (Join-Path $PRES "Dockerfile") -Encoding UTF8
+
+@'
+{
+  "name": "presale-panel",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "ethers": "^6.10.0",
+    "next": "^14.2.3",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0"
+  }
+}
+'@ | Set-Content -Path (Join-Path $PRES "package.json") -Encoding UTF8
+
+@'
+/** @type {import('next').NextConfig} */
+const nextConfig = { reactStrictMode: true };
+module.exports = nextConfig;
+'@ | Set-Content -Path (Join-Path $PRES "next.config.js") -Encoding UTF8
+
+@'
+export const ERC20_ABI = [
+  "function name() view returns (string)",
+  "function symbol() view returns (string)",
+  "function decimals() view returns (uint8)",
+  "function totalSupply() view returns (uint256)",
+  "function balanceOf(address) view returns (uint256)"
+];
+'@ | Set-Content -Path (Join-Path $PRES "lib\erc20.ts") -Encoding UTF8
+
+@'
+import { useEffect, useState } from "react";
+import { BrowserProvider } from "ethers";
+
+export default function ConnectWallet({ onConnected }:{ onConnected:(acc:string, chainId:number)=>void }){
+  const [account,setAccount]=useState<string>("");
+
+  async function connect(){
+    if(typeof window === "undefined" || !(window as any).ethereum){ alert("MetaMask não encontrada"); return; }
+    const provider = new BrowserProvider((window as any).ethereum);
+    const accs = await (window as any).ethereum.request({ method: "eth_requestAccounts" });
+    const net = await provider.getNetwork();
+    setAccount(accs[0]);
+    onConnected(accs[0], Number(net.chainId));
+  }
+
+  return (
+    <button onClick={connect} style={{padding:8, border:"1px solid #ccc", borderRadius:6}}>
+      {account? `Conectado: ${account.slice(0,6)}…${account.slice(-4)}` : "Conectar MetaMask"}
+    </button>
+  );
+}
+'@ | Set-Content -Path (Join-Path $PRES "components\ConnectWallet.tsx") -Encoding UTF8
+
+@'
+import Head from "next/head";
+import { JsonRpcProvider, Contract, formatUnits } from "ethers";
+import { useEffect, useState } from "react";
+import ConnectWallet from "../components/ConnectWallet";
+import { ERC20_ABI } from "../lib/erc20";
+
+const TITLE = process.env.NEXT_PUBLIC_SITE_TITLE || "Pré-venda do Token";
+const TOKEN  = process.env.NEXT_PUBLIC_TOKEN_ADDRESS || "";
+const RPC    = process.env.NEXT_PUBLIC_CHAIN_RPC || "";
+
+export default function Home(){
+  const [info,setInfo]=useState<any>({});
+  const [holder,setHolder]=useState<{acc?:string,chainId?:number}>({});
+
+  useEffect(()=>{ (async ()=>{
+    if(!TOKEN || !RPC) return;
+    const provider = new JsonRpcProvider(RPC);
+    const erc20 = new Contract(TOKEN, ERC20_ABI, provider);
+    try{
+      const [name,symbol,decimals,totalSupply] = await Promise.all([
+        erc20.name(), erc20.symbol(), erc20.decimals(), erc20.totalSupply()
+      ]);
+      setInfo({name,symbol,decimals:Number(decimals),totalSupply: totalSupply.toString()});
+    }catch(e){ console.error(e); }
+  })(); },[]);
+
+  return (
+    <>
+      <Head><title>{TITLE}</title></Head>
+      <m
+(Content truncated due to size limit. Use page ranges or line ranges to read remaining content)

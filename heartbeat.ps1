@@ -1,0 +1,1 @@
+﻿& 'C:\AgenteManus\manus-cli.ps1' run -port 8813 -skill loki_push -payload '{ "config_path":"C:\\AgenteManus\\workspace\\auth-config.json", "text":"manus alive ✅", "labels":{"job":"manus","env":"prod"} }' | Out-Null

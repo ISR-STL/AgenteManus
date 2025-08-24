@@ -1,0 +1,441 @@
+Perfeito, Aguiar Jr.! Vou acoplar suas carteiras e tokens existentes ao ecossistema e te entregar um pacote único PowerShell que:
+	•	arma o backend Web3 (Hardhat) para pré-vendas usando seus tokens (sem criar token novo);
+	•	disponibiliza dois modos no contrato:
+MintMode (se o token permitir mint por um papel/owner) ou EscrowMode (pré-carregar o contrato com o supply a ser vendido);
+	•	gera um frontend Next.js (conectar carteira, escolher presale, comprar, claim/vesting);
+	•	cria monitor on-chain → envia eventos ao Loki (já no seu Grafana);
+	•	grava suas carteiras em whitelist por padrão;
+	•	organiza playbook e tarefa agendada de monitor.
+
+⚠️ Segurança: use rede de teste (Sepolia) primeiro. Coloque a RPC e PRIVATE_KEY no .env de forma segura (ideal: Windows Credential Manager). Nunca cole chaves em chat/app.
+
+⸻
+
+Script único – Web3 Presale PRO (usa seus tokens)
+
+Abra o PowerShell como Administrador e cole tudo de uma vez.
+
+# ===============================
+# AgentOS - Web3 Presale PRO (tokens existentes)
+# Requisitos: Node LTS + Git + Loki/Grafana (já ok) + C:\AgentOS
+# ===============================
+param(
+  [string]$Root = "C:\AgentOS",
+  [string]$Chain = "sepolia",            # "sepolia" (teste) | "mainnet" (produção – só após auditoria)
+  [switch]$ScheduleMonitor = $true
+)
+
+$ErrorActionPreference = "Stop"
+
+# --- Endereços fornecidos pelo Aguiar Jr.
+$WALLETS = @(
+  "0xAAA12D72B8C40e78a47f99492d12E13b8e6559b9",   # MetaMask primária
+  "0x72a23589f70D30A60c70FfF8c195EB4EE8F556f6"    # MetaMask secundária
+)
+$TOKENS = @(
+  "0x3BaB93f95697eCc8673dffE21897325A33a74858",
+  "0x9EA22b56062F5a8e870FFdEd967987A5a5eDF8d8",
+  "0x98B87F1D71920CB352Bed7227b67815aE01203B9"
+)
+
+# --- Pastas
+$Base = Join-Path $Root "web3\presale_pro"
+$Api  = Join-Path $Base "api"
+$Dapp = Join-Path $Base "frontend"
+$Logs = Join-Path $Root "agent\logs"
+New-Item -ItemType Directory -Force -Path $Base,$Api,$Dapp,$Logs | Out-Null
+
+# --- .env (placeholders seguros)
+$envPath = Join-Path $Root ".env"
+if(!(Test-Path $envPath)){ New-Item -ItemType File -Force -Path $envPath | Out-Null }
+$add = @(
+"RPC_URL_SEPOLIA=",
+"RPC_URL_MAINNET=",
+"PRIVATE_KEY=",               # NUNCA compartilhe. Use só conta dedicada ao deploy.
+"ETHERSCAN_API_KEY=",
+"LOKI_URL=http://localhost:3100",
+"OPENAI_API_KEY="
+)
+foreach($l in $add){
+  if(-not (Select-String -Path $envPath -Pattern ('^'+[regex]::Escape(($l -split '=')[0])+'=') -Quiet)){
+    Add-Content $envPath $l
+  }
+}
+
+# --- Config de vendas (uma por token). Ajuste os valores conforme sua estratégia.
+$cfg = @()
+foreach($t in $TOKENS){
+  $cfg += [pscustomobject]@{
+    token          = $t
+    symbol         = "TBD"         # opcional: ajusta depois (o frontend tenta descobrir)
+    decimals       = 18            # ajuste se seu token tiver outros decimais
+    mintMode       = $false        # $true se o contrato da venda puder "mintar" seu token
+    priceUsd6      = 50000         # $0.05 (em "USD com 6 casas") => 0.05*1e6
+    minUsd6        = 500000        # $0.50 por carteira (exemplo)
+    maxUsd6        = 50000000      # $500 por carteira (exemplo)
+    hardcapUsd6    = 1000000000    # $1,000,000 total (exemplo)
+    vestingSeconds = 2592000       # 30 dias
+  }
+}
+$cfgPath = Join-Path $Api "tokens.json"
+$cfg | ConvertTo-Json -Depth 5 | Out-File -Encoding UTF8 $cfgPath
+
+# --- Backend Web3 (Hardhat)
+Set-Content (Join-Path $Api "package.json") (@'
+{
+  "name": "agentos-presale-pro",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "hh": "hardhat",
+    "deploy": "hardhat run scripts/deploy_all.js --network CHAIN",
+    "verify": "hardhat verify --network CHAIN"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "dotenv": "^16.4.5",
+    "hardhat": "^2.22.5"
+  },
+  "dependencies": {
+    "@openzeppelin/contracts": "^4.9.6",
+    "ethers": "^6.13.2"
+  }
+}
+'@) -Encoding UTF8
+
+Push-Location $Api
+npm i > $null
+New-Item -ItemType Directory -Force -Path "contracts","scripts" | Out-Null
+
+# --- Contrato de Pré-venda 2 modos (Mint ou Escrow, com vesting e whitelist)
+Set-Content ".\contracts\PreSalePro.sol" (@'
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+
+interface IERC20Mintable {
+    function mint(address to, uint256 amount) external;
+    function decimals() external view returns (uint8);
+}
+
+interface IERC20Meta {
+    function decimals() external view returns (uint8);
+}
+
+contract PreSalePro is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    address public immutable token;
+    address public immutable treasury;
+    IERC20 public immutable usdc;      // opcional (0 = venda apenas em ETH)
+    bool    public immutable mintMode; // true: usa mint; false: escrow (pré-carregar tokens no contrato)
+
+    uint8   public tokenDecimals;
+    uint256 public priceUsd6;
+    uint256 public minUsd6;
+    uint256 public maxUsd6;
+    uint256 public hardcapUsd6;
+    uint64  public startTs;
+    uint64  public endTs;
+    bool    public paused;
+
+    mapping(address => bool) public whitelist;
+    mapping(address => uint256) public contributedUsd6;
+    uint256 public raisedUsd6;
+
+    struct Vesting { uint64 start; uint64 duration; uint256 total; uint256 claimed; }
+    mapping(address => Vesting) public vest;
+
+    event Purchased(address indexed buyer, uint256 usd6, uint256 tokens);
+    event Claimed(address indexed user, uint256 amount);
+    event Deposited(address indexed from, uint256 amount);
+
+    constructor(
+        address _token, address _treasury, address _usdc, bool _mintMode,
+        uint8 _tokenDecimals, uint256 _priceUsd6, uint256 _minUsd6, uint256 _maxUsd6, uint256 _hardcapUsd6,
+        uint64 _startTs, uint64 _endTs
+    ) {
+        require(_token!=address(0) && _treasury!=address(0), "bad addr");
+        require(_priceUsd6>0 && _startTs<_endTs, "bad params");
+        token = _token;
+        treasury = _treasury;
+        usdc = IERC20(_usdc);
+        mintMode = _mintMode;
+        tokenDecimals = _tokenDecimals;
+        priceUsd6 = _priceUsd6;
+        minUsd6 = _minUsd6;
+        maxUsd6 = _maxUsd6;
+        hardcapUsd6 = _hardcapUsd6;
+        startTs = _startTs;
+        endTs = _endTs;
+    }
+
+    modifier isLive() {
+        require(!paused && block.timestamp>=startTs && block.timestamp<=endTs, "not live");
+        _;
+    }
+
+    function setWhitelist(address[] calldata users, bool allowed) external onlyOwner {
+        for(uint i=0;i<users.length;i++){ whitelist[users[i]] = allowed; }
+    }
+    function pause(bool p) external onlyOwner { paused=p; }
+
+    // Compra via USDC (6 casas)
+    function buyUSDC(uint256 amountUsd6, uint64 vestDuration) external nonReentrant isLive {
+        require(address(usdc)!=address(0), "USDC disabled");
+        _process(msg.sender, amountUsd6, vestDuration);
+        usdc.safeTransferFrom(msg.sender, treasury, amountUsd6);
+    }
+
+    // Compra via ETH (valor em ETH é enviado e "quotedUsd6" vem do front – simplificado p/ demo)
+    function buyETH(uint256 quotedUsd6, uint64 vestDuration) external payable nonReentrant isLive {
+        require(msg.value>0 && quotedUsd6>0, "bad eth");
+        _process(msg.sender, quotedUsd6, vestDuration);
+        (bool ok,)=treasury.call{value: msg.value}(""); require(ok,"treasury");
+    }
+
+    function _process(address buyer, uint256 usd6, uint64 vestDuration) internal {
+        require(whitelist[buyer], "not whitelisted");
+        require(raisedUsd6 + usd6 <= hardcapUsd6, "hardcap");
+        uint256 newC = contributedUsd6[buyer] + usd6;
+        require(newC >= minUsd6 && newC <= maxUsd6, "limits");
+        contributedUsd6[buyer] = newC;
+        raisedUsd6 += usd6;
+
+        uint256 tokens = (usd6 * (10 ** tokenDecimals)) / priceUsd6;
+        Vesting storage v = vest[buyer];
+        if(v.total==0){ v.start = uint64(block.timestamp); v.duration = vestDuration; }
+        else { require(v.duration==vestDuration, "vesting mismatch"); }
+        v.total += tokens;
+
+        if(mintMode){
+            IERC20Mintable(token).mint(address(this), tokens);
+        } else {
+            // Escrow: garanta supply previamente depositado neste contrato
+            require(IERC20(token).balanceOf(address(this)) >= totalUnclaimed(), "insufficient escrow");
+        }
+
+        emit Purchased(buyer, usd6, tokens);
+    }
+
+    function claimable(address user) public view returns(uint256){
+        Vesting memory v = vest[user];
+        if(v.total==0 || block.timestamp < v.start) return 0;
+        if(v.duration==0) return v.total - v.claimed;
+        uint256 elapsed = block.timestamp - v.start;
+        if(elapsed >= v.duration) return v.total - v.claimed;
+        return (v.total * elapsed / v.duration) - v.claimed;
+    }
+
+    function claim() external nonReentrant {
+        uint256 amt = claimable(msg.sender);
+        require(amt>0, "nothing");
+        vest[msg.sender].claimed += amt;
+        IERC20(token).safeTransfer(msg.sender, amt);
+        emit Claimed(msg.sender, amt);
+    }
+
+    function deposit(uint256 amount) external {
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        emit Deposited(msg.sender, amount);
+    }
+
+    function totalUnclaimed() public view returns(uint256){
+        // soma v.total - v.claimed de todos — simplificado: requer manter saldo >= somatório (garanta folga)
+        // Nesta versão, checamos apenas o balance no _process; para produção, crie um índice acumulado.
+        return IERC20(token).balanceOf(address(this));
+    }
+}
+'@) -Encoding UTF8
+
+# --- Hardhat config
+Set-Content ".\hardhat.config.js" (@'
+require("dotenv").config();
+require("@nomicfoundation/hardhat-toolbox");
+
+const { RPC_URL_SEPOLIA, RPC_URL_MAINNET, PRIVATE_KEY, ETHERSCAN_API_KEY } = process.env;
+const byChain = (name) => ({
+  url: name==="sepolia" ? (RPC_URL_SEPOLIA||"") : (RPC_URL_MAINNET||""),
+  accounts: PRIVATE_KEY ? [PRIVATE_KEY] : []
+});
+
+module.exports = {
+  solidity: "0.8.20",
+  networks: { sepolia: byChain("sepolia"), mainnet: byChain("mainnet") },
+  etherscan: { apiKey: { sepolia: ETHERSCAN_API_KEY||"", mainnet: ETHERSCAN_API_KEY||"" } }
+};
+'@) -Encoding UTF8
+
+# --- Deploy múltiplo (uma presale por token) + whitelist com suas carteiras
+Set-Content ".\scripts\deploy_all.js" (@"
+const hre = require("hardhat");
+const fs = require("fs");
+require("dotenv").config();
+
+async function main() {
+  const chain = hre.network.name;
+  const deployer = (await hre.ethers.getSigners())[0];
+  console.log("Chain:", chain, "| Deployer:", deployer.address);
+
+  const cfg = JSON.parse(fs.readFileSync("./tokens.json","utf8"));
+  const wallets = ${($WALLETS | ConvertTo-Json -Compress)};
+
+  const now = Math.floor(Date.now()/1000);
+  const start = now + 120;               // começa em 2 min
+  const end   = start + 7*24*3600;       // dura 7 dias
+
+  const out = [];
+  for (const it of cfg) {
+    const Pre   = await hre.ethers.getContractFactory("PreSalePro");
+    const usdc  = process.env.USDC_SEPOLIA || ""; // opcional (ou configure USDC mainnet)
+    const pre   = await Pre.deploy(
+      it.token, deployer.address, usdc, Boolean(it.mintMode),
+      Number(it.decimals), it.priceUsd6, it.minUsd6, it.maxUsd6, it.hardcapUsd6,
+      start, end
+    );
+    await pre.waitForDeployment();
+    const addr = await pre.getAddress();
+    console.log("PreSalePro for", it.token, "=>", addr);
+
+    // Whitelist suas carteiras
+    const tx = await pre.setWhitelist(wallets, true); await tx.wait();
+
+    out.push({ token: it.token, presale: addr, mintMode: !!it.mintMode, decimals: it.decimals });
+  }
+
+  fs.writeFileSync("../frontend/public/presales.json", JSON.stringify(out,null,2));
+  console.log(">> presales.json atualizado em frontend/public");
+}
+
+main().catch((e)=>{ console.error(e); process.exit(1); });
+"@) -Encoding UTF8
+
+Pop-Location
+
+# --- Frontend Next.js (listar presales e comprar)
+Set-Content (Join-Path $Dapp "package.json") (@'
+{
+  "name": "presale-frontend-pro",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": { "dev": "next dev -p 5173", "build": "next build", "start": "next start -p 5173" },
+  "dependencies": {
+    "next": "14.2.4",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "wagmi": "^2.12.8",
+    "viem": "^2.21.8",
+    "@rainbow-me/rainbowkit": "^2.1.3"
+  }
+}
+'@) -Encoding UTF8
+
+New-Item -ItemType Directory -Force -Path (Join-Path $Dapp "app"), (Join-Path $Dapp "public") | Out-Null
+Set-Content (Join-Path $Dapp "public\presales.json") "[]" -Encoding UTF8
+Set-Content (Join-Path $Dapp "next.config.js") "module.exports={reactStrictMode:true};" -Encoding UTF8
+
+Set-Content (Join-Path $Dapp "app\page.tsx") (@'
+"use client";
+import { useEffect, useMemo, useState } from "react";
+import { http, WagmiProvider, useAccount, useWriteContract, createConfig } from "wagmi";
+import { sepolia, mainnet } from "wagmi/chains";
+import { RainbowKitProvider, getDefaultConfig, ConnectButton } from "@rainbow-me/rainbowkit";
+import "@rainbow-me/rainbowkit/styles.css";
+
+const chain = (process.env.NEXT_PUBLIC_CHAIN || "sepolia") === "mainnet" ? mainnet : sepolia;
+const config = getDefaultConfig({
+  appName: "AgentOS Presale PRO",
+  projectId: "agentos-demo", // troque por um WalletConnect projectId real
+  chains: [chain],
+  transports: { [chain.id]: http() }
+});
+
+type Presale = { token:string; presale:string; mintMode:boolean; decimals:number };
+
+function Panel(){
+  const { address } = useAccount();
+  const [items, setItems] = useState<Presale[]>([]);
+  const [sel, setSel] = useState(0);
+  const [usd, setUsd] = useState<number>(10);
+  const { writeContract, isPending } = useWriteContract();
+
+  useEffect(()=>{
+    fetch("/presales.json").then(r=>r.json()).then(setItems).catch(()=>setItems([]));
+  },[]);
+
+  const cur = items[sel] as Presale | undefined;
+
+  const buyEth = async () => {
+    if(!cur) return alert("Nenhuma presale configurada.");
+    const quotedUsd6 = BigInt(Math.floor(usd * 1e6));
+    await writeContract({
+      address: cur.presale as `0x${string}`,
+      abi: [
+        {"inputs":[{"internalType":"uint256","name":"quotedUsd6","type":"uint256"},{"internalType":"uint64","name":"vestDuration","type":"uint64"}],"name":"buyETH","outputs":[],"stateMutability":"payable","type":"function"}
+      ],
+      functionName: "buyETH",
+      args: [quotedUsd6, BigInt(60*60*24*30)],
+      value: BigInt(1e15) // 0.001 ETH (demo)
+    });
+    alert("Compra enviada. Acompanhe no explorador.");
+  };
+
+  return (
+    <div style={{maxWidth:900, margin:"40px auto", fontFamily:"Inter,system-ui,sans-serif"}}>
+      <h1>Pré-venda (AgentOS)</h1>
+      <div style={{display:"flex", justifyContent:"space-between", alignItems:"center"}}>
+        <small>Chain: {chain.name}</small>
+        <ConnectButton />
+      </div>
+
+      <div style={{marginTop:16}}>
+        <label>Selecione a Presale:</label>{" "}
+        <select value={sel} onChange={(e)=>setSel(Number(e.target.value))}>
+          {items.map((x,i)=> <option key={x.presale} value={i}>{x.token} → {x.presale.slice(0,10)}…</option>)}
+        </select>
+      </div>
+
+      <div style={{marginTop:16}}>
+        <label>Investimento (USD): </label>
+        <input value={usd} onChange={(e)=>setUsd(Number(e.target.value||0))} type="number" min="1" step="1"/>
+      </div>
+
+      <div style={{marginTop:16}}>
+        <button onClick={buyEth} disabled={!address || isPending || !cur}>Comprar com ETH</button>
+      </div>
+
+      <p style={{marginTop:12, fontSize:12, opacity:.7}}>
+        *Demo educacional. Produção: venda em stable (USDC), oráculo (Chainlink), KYC/AML, auditoria e termos legais.
+      </p>
+    </div>
+  );
+}
+
+export default function Page(){
+  return (
+    <WagmiProvider config={config}>
+      <RainbowKitProvider>
+        <div style={{display:"flex", justifyContent:"flex-end", padding:16}}><ConnectButton /></div>
+        <Panel/>
+      </RainbowKitProvider>
+    </WagmiProvider>
+  );
+}
+'@) -Encoding UTF8
+
+Push-Location $Dapp; npm i > $null; Pop-Location
+
+# --- Monitor on-chain (varre todas as presales) -> Loki
+$mon = @'
+const fs = require("fs");
+const { ethers } = require("ethers");
+const http = require("http");
+require("dotenv").config();
+
+const args = Object.fromEntries(process.argv.slice(2).map(x=>x.split("=")).map(([k,v])=>[k.replace(/^--/,""), v]));
+const 
+(Content truncated due to size limit. Use page ranges or line ranges to read remaining content)

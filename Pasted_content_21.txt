@@ -1,0 +1,56 @@
+O que está INCOMPLETO / NÃO FAZ
+	•	Core ausente: o script tenta montar core\manus_core.py lendo arquivos de Linux (/home/ubuntu/...), que não existem no Windows. Resultado: instalação quebra na “Seção 10 – Baixar código Python” e não há servidor para a porta 8080.
+	•	UI/HTTP não entregue: há mensagens “Interface disponível em http://localhost:8080”, porém não há FastAPI/Flask rodando nem comando uvicorn/flask run.
+	•	Office/IA/Web3/Trading só como promessa: bibliotecas estão no requirements, mas não há rotas, jobs ou orquestração implementadas para planilhas, Word/PPT, LLMs, Web3 (web3.py) ou ccxt.
+	•	Automação Windows “logon-task” ausente: só há modo serviço (NSSM). Sem fallback para Scheduled Task em ambiente corporativo sem privilégio de serviço.
+	•	Instalação pesada e frágil: TensorFlow/Torch + Selenium/Playwright incham o build, exigem rede aberta e wheels compatíveis — alto risco de falha/tempo de instalação.
+	•	Segredos em texto plano: .env em C:\AgenteManus. Sem Windows Credential Manager/DPAPI.
+	•	Compliance corporativa: Add-AppxPackage, download do NSSM e winget podem ser bloqueados por políticas; não há pre-flight checks nem caminhos alternativos.
+	•	Observabilidade & SLOs: não há /health, /metrics, log rotation, nem structured logging (JSON) integrado.
+
+⸻
+
+3) Oportunidades de melhoria (priorizadas, “quick wins” → “foundation”)
+
+A. Consertos críticos (D0) — “make it run”
+	1.	Embed do core real (MVP)
+	•	Substituir a “Seção 10” por um here-doc de um manus_core.py mínimo (FastAPI + fila de tarefas + endpoints /health, /run_task, /status/<id>).
+	•	Incluir uvicorn no start_manus.bat (ex.: python -m uvicorn core.manus_core:app --host 0.0.0.0 --port 8080).
+	2.	Remover dependências pesadas do baseline
+	•	Criar perfis de instalação: core (mínimo), office, web3, trading, vision. Instalar extras on-demand.
+	3.	Fallback corporativo sem admin
+	•	Se falhar NSSM/serviço, criar Scheduled Task “At logon” do usuário com o mesmo start_manus.ps1.
+	4.	Segredos seguros
+	•	Integrar Windows Credential Manager (ou DPAPI) e ler tokens via keyring/pywin32 — .env só com placeholders.
+
+B. Arquitetura “prod-ready” (D1–D7) — “make it reliable”
+	5.	Config as code + validação
+	•	pydantic para validar config.json e .env (hard-fail com mensagem clara).
+	6.	Observabilidade
+	•	/health (liveness/readiness), /metrics (Prometheus text), logs em JSON com rotação e nível por módulo.
+	7.	Fila e idempotência
+	•	Job queue simples (SQLite + estado) para tarefas Office/Web/Web3; idempotency keys por tarefa.
+	8.	Drivers Office pragmáticos
+	•	openpyxl, python-docx, python-pptx, pypdf/pypdfium2 — fluxos de exemplos prontos (criar planilha, montar PPT a partir de prompt, gerar PDF).
+	9.	Web automations “safe”
+	•	Preferir Playwright headless; para Selenium, usar webdriver-manager. Feature flag por engine.
+	10.	Web3/Trading controlado
+
+	•	Habilitar web3.py e ccxt só quando as chaves estiverem no Credential Manager; modo paper trading por padrão. Guard rails de risco no config.json (teto posição, SL/TP, circuit breaker).
+
+	11.	Distribuição corporativa
+
+	•	Opção user-mode (instala tudo em %LOCALAPPDATA%) + admin-mode (serviço). Detecção automática de políticas.
+
+C. Governança & Segurança (D7–D14) — “make it trustworthy”
+	12.	CIS hardening “mínimo viável”
+
+	•	Sem downloads fora de allowlist; hash pinning para NSSM; code integrity e hash check pós-download.
+
+	13.	RBAC simples
+
+	•	Perfis de operação (Operador, Instrutor, Admin) com escopo por módulo.
+
+	14.	Trilhas de auditoria
+
+	•	Log de quem executou o quê, com correlation ID por tarefa.

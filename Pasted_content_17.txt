@@ -1,0 +1,199 @@
+	•	audita e melhora suas landpages / sites / apps;
+	•	gera e ajusta código (com PR automático);
+	•	compila, testa, audita (Lighthouse) e implanta;
+	•	monitora periodicamente e alerta quando algo degrada;
+	•	tudo sob policy, com telemetria no Loki/Grafana.
+
+Abaixo entrego um único script PowerShell que expande o stack que já criamos. Ele instala Node LTS + CLIs (Lighthouse/Vercel), adiciona adapters (Git, Node, Lighthouse, Deploy, Loki), cria o autopilot (loop de backend+frontend), arquivos de config, playbooks e uma tarefa agendada que roda sozinha.
+
+Rode em PowerShell Administrador. Copie/cole tudo:
+
+# ===============================
+# AgentOS - Web/App Autopilot (Backend + Frontend + Monitoramento)
+# Expande C:\AgentOS existente
+# ===============================
+param(
+  [switch]$ScheduleAutopilot = $true,     # cria tarefa a cada 30 min
+  [string]$Root = "C:\AgentOS"
+)
+
+$ErrorActionPreference = "Stop"
+$AgentDir = Join-Path $Root "agent"
+$CoreDir  = Join-Path $AgentDir "core"
+$AdpDir   = Join-Path $AgentDir "adapters"
+$CfgDir   = Join-Path $AgentDir "config"
+$PbDir    = Join-Path $AgentDir "playbooks"
+$OutDir   = Join-Path $AgentDir "output\web"
+$LogsDir  = Join-Path $AgentDir "logs"
+$ReposDir = Join-Path $Root "repos"
+New-Item -ItemType Directory -Force -Path $CoreDir,$AdpDir,$CfgDir,$PbDir,$OutDir,$LogsDir,$ReposDir | Out-Null
+
+# --- Node LTS (se necessário) + CLIs
+try {
+  $node = (node -v) 2>$null
+} catch {
+  Write-Host "[Node] Instalando Node LTS via winget..." -ForegroundColor Cyan
+  winget install -e --id OpenJS.NodeJS.LTS --source winget --accept-source-agreements --accept-package-agreements
+}
+npm -v | Out-Null
+# CLIs úteis (globais). Se já tiver, ignora.
+npm i -g lighthouse vercel netlify-cli svgo > $null 2>&1
+
+# --- Requisitos Python extras (atualiza o .venv existente)
+$Pip = Join-Path $Root ".venv\Scripts\pip.exe"
+$Py  = Join-Path $Root ".venv\Scripts\python.exe"
+$moreReq = @'
+pillow==10.4.0
+'@
+Add-Content -Path (Join-Path $AgentDir "requirements.txt") -Value $moreReq
+& $Pip install -r (Join-Path $AgentDir "requirements.txt")
+
+# --- ENV (.env) com tokens (apenas placeholders — você preenche)
+$envFile = Join-Path $Root ".env"
+if(!(Test-Path $envFile)){ New-Item -ItemType File -Force -Path $envFile | Out-Null }
+$envLines = @(
+"OPENAI_API_KEY=",
+"GH_TOKEN=",               # GitHub PAT p/ PRs (repo scope)
+"GITLAB_TOKEN=",           # opcional
+"VERCEL_TOKEN=",           # p/ deploy
+"CLOUDFLARE_API_TOKEN=",   # opcional (purge cache)
+"LOKI_URL=http://localhost:3100"  # Loki no seu host
+)
+foreach($l in $envLines){
+  if(-not (Select-String -Path $envFile -Pattern ('^'+[regex]::Escape(($l -split '=')[0])+'=') -Quiet)){
+    Add-Content $envFile $l
+  }
+}
+
+# --- Adapters (Python) ---------------------------
+
+# 1) Git (clone/branch/commit/push/PR GitHub)
+$git_py = @'
+import os, subprocess, json, pathlib, http.client, base64
+from urllib.parse import urlparse
+
+class Git:
+    name = "repo.git"
+    def _run(self, args, cwd=None):
+        p = subprocess.run(["git"]+args, cwd=cwd, capture_output=True, text=True)
+        if p.returncode!=0: raise RuntimeError(p.stderr.strip())
+        return p.stdout.strip()
+
+    def clone(self, url:str, dest:str, branch:str="main"):
+        pathlib.Path(dest).parent.mkdir(parents=True, exist_ok=True)
+        if not pathlib.Path(dest, ".git").exists():
+            self._run(["clone", url, dest])
+        self._run(["fetch","--all"], cwd=dest)
+        self._run(["checkout", branch], cwd=dest)
+        return {"ok":True,"path":dest}
+
+    def create_branch(self, repo:str, new_branch:str):
+        self._run(["checkout","-B",new_branch], cwd=repo); return {"ok":True}
+
+    def commit_all(self, repo:str, msg:str):
+        self._run(["add","-A"], cwd=repo)
+        # commit vazio pode falhar; ignore se não houver mudanças
+        try: self._run(["commit","-m",msg], cwd=repo)
+        except Exception as e: return {"ok":True,"note":"no changes"}
+        return {"ok":True}
+
+    def push(self, repo:str, branch:str):
+        self._run(["push","-u","origin",branch], cwd=repo); return {"ok":True}
+
+    def pr_github(self, owner:str, repo:str, head:str, base:str="main", title:str="AgentOS PR", body:str=""):
+        token = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
+        if not token: raise RuntimeError("GH_TOKEN ausente")
+        payload = json.dumps({"title":title,"head":head,"base":base,"body":body})
+        conn = http.client.HTTPSConnection("api.github.com")
+        headers={"Authorization":f"Bearer {token}","User-Agent":"AgentOS","Accept":"application/vnd.github+json"}
+        conn.request("POST", f"/repos/{owner}/{repo}/pulls", payload, headers)
+        r = conn.getresponse(); data=r.read().decode()
+        if r.status>=300: raise RuntimeError(f"GitHub PR erro {r.status}: {data}")
+        return {"ok":True,"response":json.loads(data)}
+'@
+Set-Content "$AdpDir\git_repo.py" $git_py -Encoding UTF8
+
+# 2) Node/NPM (instalar/build/lint/test)
+$node_py = @'
+import subprocess, os
+
+class NodeCLI:
+    name = "node.cli"
+    def _run(self, args, cwd):
+        p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, shell=True)
+        if p.returncode!=0: raise RuntimeError(p.stderr or p.stdout)
+        return {"ok":True,"out":p.stdout[-2000:]}
+
+    def npm_install(self, project_dir:str):
+        return self._run(["npm","ci" if os.path.exists(os.path.join(project_dir,"package-lock.json")) else "install"], project_dir)
+
+    def npm_script(self, project_dir:str, script:str="build"):
+        return self._run(["npm","run",script,"--","--no-cache"], project_dir)
+'@
+Set-Content "$AdpDir\node_cli.py" $node_py -Encoding UTF8
+
+# 3) Lighthouse (auditoria de performance/SEO)
+$lighthouse_py = @'
+import subprocess, json, os, pathlib, datetime
+
+class Lighthouse:
+    name = "web.lighthouse"
+    def run(self, url:str, out_dir:str, throttle:str="desktop"):
+        pathlib.Path(out_dir).mkdir(parents=True, exist_ok=True)
+        ts = datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+        json_path = os.path.join(out_dir, f"lh-{ts}.json")
+        html_path = os.path.join(out_dir, f"lh-{ts}.html")
+        cmd = ["npx","--yes","lighthouse", url, "--output=json","--output=html",
+               f"--output-path={os.path.splitext(json_path)[0]}",
+               f"--{throttle}","--quiet","--only-categories=performance,seo,accessibility,best-practices"]
+        p = subprocess.run(cmd, capture_output=True, text=True, shell=True)
+        if p.returncode!=0: raise RuntimeError(p.stderr or p.stdout)
+        with open(json_path,"r",encoding="utf-8") as f:
+            data=json.load(f)
+        cats=data.get("categories",{})
+        scores={k: round(v.get("score",0)*100) for k,v in cats.items()}
+        scores["report_json"]=json_path; scores["report_html"]=html_path
+        return scores
+'@
+Set-Content "$AdpDir\lighthouse.py" $lighthouse_py -Encoding UTF8
+
+# 4) Loki push (envia logs estruturados)
+$loki_py = @'
+import os, json, time, urllib.request
+
+class Loki:
+    name = "logs.loki"
+    def push(self, stream:dict, lines:list):
+        url = (os.getenv("LOKI_URL") or "http://localhost:3100").rstrip("/")+ "/loki/api/v1/push"
+        ts = lambda: str(int(time.time()*1e9))
+        entries=[{"ts":ts(),"line":json.dumps(l)} for l in lines]
+        body={"streams":[{"stream":stream,"values":[[e["ts"], e["line"]] for e in entries]}]}
+        req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"), headers={"Content-Type":"application/json"})
+        with urllib.request.urlopen(req) as r: r.read()
+        return {"ok":True,"sent":len(entries)}
+'@
+Set-Content "$AdpDir\loki.py" $loki_py -Encoding UTF8
+
+# 5) Deploy (Vercel CLI)
+$vercel_py = @'
+import os, subprocess
+
+class Vercel:
+    name = "deploy.vercel"
+    def deploy(self, project_dir:str, prod:bool=True):
+        tok = os.getenv("VERCEL_TOKEN")
+        if not tok: raise RuntimeError("VERCEL_TOKEN ausente")
+        args=["vercel","--token",tok,"--yes"]
+        if prod: args+=["--prod"]
+        p = subprocess.run(args, cwd=project_dir, capture_output=True, text=True, shell=True)
+        if p.returncode!=0: raise RuntimeError(p.stderr or p.stdout)
+        return {"ok":True,"out":p.stdout[-2000:]}
+'@
+Set-Content "$AdpDir\vercel_cli.py" $vercel_py -Encoding UTF8
+
+# 6) Otimizador simples de assets (SVG via SVGO; imagens grandes com Pillow)
+$assets_py = @'
+import os, subprocess, pathlib
+from PIL import Image
+
+class Assets:
