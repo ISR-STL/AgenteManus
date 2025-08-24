@@ -1,0 +1,55 @@
+﻿name: CI — Telegram & README
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  notify_and_update:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Notify Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          REPO:   ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          ACTOR:  ${{ github.actor }}
+          SHA:    ${{ github.sha }}
+          MSG:    ${{ github.event.head_commit.message }}
+        run: |
+          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+            echo "Sem secrets TELEGRAM_* — pulando notificação."
+            exit 0
+          fi
+          TEXT="✅ Push em $REPO ($BRANCH) por $ACTOR
+          $MSG
+          $SHA"
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            --data-urlencode text="$TEXT" >/dev/null
+
+      - name: Update README timestamp
+        run: |
+          ts="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          if grep -q '^Last update:' README.md; then
+            sed -i "s/^Last update:.*/Last update: ${ts}/" README.md
+          else
+            printf "\nLast update: %s\n" "$ts" >> README.md
+          fi
+          if git diff --quiet README.md; then
+            echo "README sem mudanças."
+          else
+            git config user.name  "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -am "docs: update README timestamp [skip ci]"
+            git push
+          fi
