@@ -1,4 +1,4 @@
-﻿name: CI - Telegram & README
+name: CI - Telegram & README
 
 on:
   push:
@@ -11,7 +11,6 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,19 +25,23 @@ jobs:
           SHA:    ${{ github.sha }}
           MSG:    ${{ github.event.head_commit.message }}
         run: |
-          if [ -z "$TELEGRAM_BOT_TOKEN" ] || [ -z "$TELEGRAM_CHAT_ID" ]; then
+          set -euo pipefail
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ] || [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
             echo "Sem secrets TELEGRAM_* - pulando notificação."
             exit 0
           fi
-          TEXT="🚀 Push em $REPO ($BRANCH) por $ACTOR
-$MSG
-$SHA"
+          cat > msg.txt <<EOF
+          🚀 Push em $REPO ($BRANCH) por $ACTOR
+          $MSG
+          $SHA
+          EOF
           curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode text="$TEXT" >/dev/null
+            --data-urlencode text@"msg.txt" >/dev/null
 
       - name: Update README timestamp
         run: |
+          set -euo pipefail
           ts="$(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           if grep -q '^Last update:' README.md; then
             sed -i "s/^Last update:.*/Last update: ${ts}/" README.md
