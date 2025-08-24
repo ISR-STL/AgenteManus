@@ -5,3 +5,5 @@ workspace/*.secret
 .env
 __pycache__/
 *.pyc
+
+workspace/auth-config.json
