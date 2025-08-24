@@ -5,10 +5,19 @@ on:
     branches: [ "main" ]
   workflow_dispatch:
 
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: notify-readme
+  cancel-in-progress: true
+
 jobs:
   notify_and_update:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     permissions:
       contents: write
     steps:
@@ -16,6 +25,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Notify Telegram
+        continue-on-error: true
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -30,14 +40,14 @@ jobs:
             echo "Sem secrets TELEGRAM_* - pulando notificação."
             exit 0
           fi
-          cat > msg.txt <<EOF
-          🚀 Push em $REPO ($BRANCH) por $ACTOR
-          $MSG
-          $SHA
-          EOF
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+          {
+            echo "🚀 Push em $REPO ($BRANCH) por $ACTOR"
+            echo "$MSG"
+            echo "$SHA"
+          } > msg.txt
+          curl -sS -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
             -d chat_id="${TELEGRAM_CHAT_ID}" \
-            --data-urlencode text@"msg.txt" >/dev/null
+            --data-urlencode text@"msg.txt" >/dev/null || true
 
       - name: Update README timestamp
         run: |
